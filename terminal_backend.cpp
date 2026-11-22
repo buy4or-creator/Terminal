@@ -6,7 +6,7 @@
 #include <atomic>
 #include <vector>
 
-#if defined(Q_OS_WIN)
+#ifdef Q_OS_WIN
 #include <windows.h>
 #include <shellapi.h>
 
@@ -34,6 +34,8 @@ ConPtyApi &conPtyApi() {
     return api;
 }
 
+#endif
+namespace {
 QString ansiColor(int idx) {
     static const char *pal[16] = {
         "#1e1e2e","#f38ba8","#a6e3a1","#f9e2af","#89b4fa","#f5c2e7","#94e2d5","#cdd6f4",
@@ -214,22 +216,34 @@ struct VtScreen {
         return QStringLiteral("<pre style=\"margin:0;white-space:pre;\">") + out.join(QLatin1Char('\n')) + QStringLiteral("</pre>");
     }
 };
+#ifdef Q_OS_WIN
 struct ConPtyState { HPCON hPC = nullptr; HANDLE hPipeInWrite = INVALID_HANDLE_VALUE, hPipeOutRead = INVALID_HANDLE_VALUE, hProcess = INVALID_HANDLE_VALUE; std::atomic_bool running{false}; VtScreen screen; };
 static QHash<const TerminalBackend *, ConPtyState *> g_states;
+#elif defined(Q_OS_LINUX)
+#include <pty.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
+#include <signal.h>
+struct LinuxPtyState { int masterFd = -1; pid_t pid = -1; std::atomic_bool running{false}; VtScreen screen; };
+static QHash<const TerminalBackend *, LinuxPtyState *> g_linuxStates;
+#endif
 }
 TerminalBackend::TerminalBackend(QObject *parent) : QObject(parent) {}
 TerminalBackend::~TerminalBackend() { stop(); }
 bool TerminalBackend::usingFallback() const { return false; }
 bool TerminalBackend::isRunning() const {
-#if defined(Q_OS_WIN)
+#ifdef Q_OS_WIN
     if (auto *st = g_states.value(this, nullptr); st && st->running.load()) return true;
+#elif defined(Q_OS_LINUX)
+    if (auto *st = g_linuxStates.value(this, nullptr); st && st->running.load()) return true;
 #endif
     return process_ && process_->state() != QProcess::NotRunning;
 }
 QProcess *TerminalBackend::process() const { return process_; }
 bool TerminalBackend::start(const QString &shell, const QSize &terminalSize, bool elevated) {
     stop();
-#if defined(Q_OS_WIN)
+#ifdef Q_OS_WIN
     const bool ps = shell.compare(QStringLiteral("powershell"), Qt::CaseInsensitive) == 0;
     const QString exe = ps ? QStringLiteral("powershell.exe") : QStringLiteral("cmd.exe");
     const QString args = ps ? QStringLiteral("-NoLogo -NoExit") : QStringLiteral("/K prompt %USERNAME%@%COMPUTERNAME%:$P$G ");
@@ -269,62 +283,8 @@ bool TerminalBackend::start(const QString &shell, const QSize &terminalSize, boo
         }
         CloseHandle(hInW); CloseHandle(hOutR);
     }
-#endif
-    return false;
-}
-void TerminalBackend::writeInput(const QByteArray &data) {
-#if defined(Q_OS_WIN)
-    if (auto *st = g_states.value(this, nullptr); st && st->running.load() && st->hPipeInWrite != INVALID_HANDLE_VALUE) {
-        DWORD written = 0; WriteFile(st->hPipeInWrite, data.constData(), static_cast<DWORD>(data.size()), &written, nullptr); FlushFileBuffers(st->hPipeInWrite); return;
-    }
-#endif
-}
-void TerminalBackend::sendCommand(const QString &command) { writeInput((command + QStringLiteral("\r")).toUtf8()); }
-void TerminalBackend::resizeTerminal(const QSize &s) {
-#if defined(Q_OS_WIN)
-    if (auto *st = g_states.value(this, nullptr); st && st->hPC && conPtyApi().resize) { st->screen.resize(s.width(), s.height()); conPtyApi().resize(st->hPC, {static_cast<SHORT>(qMax(40, s.width())), static_cast<SHORT>(qMax(15, s.height()))}); }
-#else
-    Q_UNUSED(s);
-#endif
-}
-void TerminalBackend::stop() {
-#if defined(Q_OS_WIN)
-    if (auto *st = g_states.take(this)) {
-        st->running.store(false); if (st->hPC && conPtyApi().close) conPtyApi().close(st->hPC);
-        if (st->hPipeInWrite != INVALID_HANDLE_VALUE) CloseHandle(st->hPipeInWrite); if (st->hPipeOutRead != INVALID_HANDLE_VALUE) CloseHandle(st->hPipeOutRead);
-        if (st->hProcess != INVALID_HANDLE_VALUE) { TerminateProcess(st->hProcess, 0); CloseHandle(st->hProcess); } delete st;
-    }
-#endif
-}
 #elif defined(Q_OS_LINUX)
-#include <pty.h>
-#include <unistd.h>
-#include <sys/ioctl.h>
-#include <sys/wait.h>
-#include <signal.h>
-#include <fcntl.h>
-
-namespace {
-struct LinuxPtyState {
-    int masterFd = -1;
-    pid_t pid = -1;
-    std::atomic_bool running{false};
-};
-static QHash<const TerminalBackend *, LinuxPtyState *> g_linuxStates;
-}
-
-TerminalBackend::TerminalBackend(QObject *parent) : QObject(parent) {}
-TerminalBackend::~TerminalBackend() { stop(); }
-bool TerminalBackend::usingFallback() const { return false; }
-bool TerminalBackend::isRunning() const {
-    if (auto *st = g_linuxStates.value(this, nullptr); st && st->running.load()) return true;
-    return false;
-}
-QProcess *TerminalBackend::process() const { return process_; }
-
-bool TerminalBackend::start(const QString &shell, const QSize &terminalSize, bool elevated) {
     Q_UNUSED(shell); Q_UNUSED(elevated);
-    stop();
     struct winsize ws{};
     ws.ws_col = static_cast<unsigned short>(qMax(40, terminalSize.width()));
     ws.ws_row = static_cast<unsigned short>(qMax(15, terminalSize.height()));
@@ -338,7 +298,7 @@ bool TerminalBackend::start(const QString &shell, const QSize &terminalSize, boo
         execlp(sh, sh, "-l", nullptr);
         _exit(127);
     }
-    auto *st = new LinuxPtyState{masterFd, pid, {true}};
+    auto *st = new LinuxPtyState{masterFd, pid, {true}, VtScreen(ws.ws_col, ws.ws_row)};
     g_linuxStates.insert(this, st);
     QPointer<TerminalBackend> guard(this);
     QThread *reader = QThread::create([guard, st] {
@@ -347,9 +307,9 @@ bool TerminalBackend::start(const QString &shell, const QSize &terminalSize, boo
             ssize_t n = read(st->masterFd, buf.data(), buf.size());
             if (n <= 0) break;
             QByteArray raw = buf.left(static_cast<int>(n));
-            QString text = QString::fromUtf8(raw);
-            if (guard) QMetaObject::invokeMethod(guard, [guard, raw, text] {
-                if (guard) { emit guard->outputReady(raw); emit guard->outputText(text); }
+            QString html = st->screen.feed(QString::fromUtf8(raw));
+            if (guard) QMetaObject::invokeMethod(guard, [guard, raw, html] {
+                if (guard) { emit guard->outputReady(raw); emit guard->outputText(html); }
             }, Qt::QueuedConnection);
         }
         if (guard) QMetaObject::invokeMethod(guard, [guard] { if (guard) emit guard->processFinished(0); }, Qt::QueuedConnection);
@@ -357,29 +317,49 @@ bool TerminalBackend::start(const QString &shell, const QSize &terminalSize, boo
     connect(reader, &QThread::finished, reader, &QObject::deleteLater);
     reader->start();
     return true;
+#endif
+    return false;
 }
-
 void TerminalBackend::writeInput(const QByteArray &data) {
+#ifdef Q_OS_LINUX
     if (auto *st = g_linuxStates.value(this, nullptr); st && st->running.load() && st->masterFd >= 0) {
-        ssize_t ignored = write(st->masterFd, data.constData(), data.size());
-        Q_UNUSED(ignored);
+        ssize_t ignored = write(st->masterFd, data.constData(), data.size()); Q_UNUSED(ignored); return;
     }
+#endif
+#ifdef Q_OS_WIN
+    if (auto *st = g_states.value(this, nullptr); st && st->running.load() && st->hPipeInWrite != INVALID_HANDLE_VALUE) {
+        DWORD written = 0; WriteFile(st->hPipeInWrite, data.constData(), static_cast<DWORD>(data.size()), &written, nullptr); FlushFileBuffers(st->hPipeInWrite); return;
+    }
+#endif
 }
-void TerminalBackend::sendCommand(const QString &command) { writeInput((command + QStringLiteral("\n")).toUtf8()); }
+void TerminalBackend::sendCommand(const QString &command) { writeInput((command + QStringLiteral("\r")).toUtf8()); }
 void TerminalBackend::resizeTerminal(const QSize &s) {
+#ifdef Q_OS_LINUX
     if (auto *st = g_linuxStates.value(this, nullptr); st && st->masterFd >= 0) {
-        struct winsize ws{};
-        ws.ws_col = static_cast<unsigned short>(qMax(40, s.width()));
-        ws.ws_row = static_cast<unsigned short>(qMax(15, s.height()));
-        ioctl(st->masterFd, TIOCSWINSZ, &ws);
+        st->screen.resize(s.width(), s.height());
+        struct winsize ws{}; ws.ws_col = static_cast<unsigned short>(qMax(40, s.width())); ws.ws_row = static_cast<unsigned short>(qMax(15, s.height()));
+        ioctl(st->masterFd, TIOCSWINSZ, &ws); return;
     }
+#endif
+#ifdef Q_OS_WIN
+    if (auto *st = g_states.value(this, nullptr); st && st->hPC && conPtyApi().resize) { st->screen.resize(s.width(), s.height()); conPtyApi().resize(st->hPC, {static_cast<SHORT>(qMax(40, s.width())), static_cast<SHORT>(qMax(15, s.height()))}); }
+#else
+    Q_UNUSED(s);
+#endif
 }
 void TerminalBackend::stop() {
+#ifdef Q_OS_WIN
+    if (auto *st = g_states.take(this)) {
+        st->running.store(false); if (st->hPC && conPtyApi().close) conPtyApi().close(st->hPC);
+        if (st->hPipeInWrite != INVALID_HANDLE_VALUE) CloseHandle(st->hPipeInWrite); if (st->hPipeOutRead != INVALID_HANDLE_VALUE) CloseHandle(st->hPipeOutRead);
+        if (st->hProcess != INVALID_HANDLE_VALUE) { TerminateProcess(st->hProcess, 0); CloseHandle(st->hProcess); } delete st;
+    }
+#elif defined(Q_OS_LINUX)
     if (auto *st = g_linuxStates.take(this)) {
         st->running.store(false);
         if (st->masterFd >= 0) close(st->masterFd);
         if (st->pid > 0) { kill(st->pid, SIGTERM); waitpid(st->pid, nullptr, WNOHANG); }
         delete st;
     }
-}
 #endif
+}
