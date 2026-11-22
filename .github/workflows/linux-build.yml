@@ -14,11 +14,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential qmake6 qt6-base-dev qt6-tools-dev libgl1-mesa-dev
       - name: Build
         run: |
-          qmake6 console-v1.pro CONFIG+=release
+          PRO_FILE=$(find . -maxdepth 2 -name "*.pro" | head -n 1)
+          qmake6 "$PRO_FILE" CONFIG+=release
           make -j$(nproc)
           mkdir -p dist/Terminal-Linux-x64
-          cp console-v1 dist/Terminal-Linux-x64/Terminal
-          cp app.ico dist/Terminal-Linux-x64/
+          BIN_FILE=$(find . -maxdepth 2 -type f -executable ! -name "*.sh" | grep -E "console|Terminal" | head -n 1)
+          cp "$BIN_FILE" dist/Terminal-Linux-x64/Terminal
+          cp "$(dirname "$PRO_FILE")/app.ico" dist/Terminal-Linux-x64/ 2>/dev/null || true
           tar -czvf Terminal-Linux-x64.tar.gz -C dist Terminal-Linux-x64
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
