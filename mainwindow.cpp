@@ -786,7 +786,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     headerLayout->addWidget(trafficSpacer);
     rootLayout->addWidget(header);
     connect(minimize, &QPushButton::clicked, this, &QWidget::showMinimized);
-    connect(maximize, &QPushButton::clicked, this, [this] { HWND h = reinterpret_cast<HWND>(winId()); ShowWindow(h, IsZoomed(h) ? SW_RESTORE : SW_MAXIMIZE); });
+    connect(maximize, &QPushButton::clicked, this, [this] { if (isMaximized()) showNormal(); else showMaximized(); });
     connect(close, &QPushButton::clicked, this, &QWidget::close);
 #ifdef Q_OS_WIN
     const HWND nativeWindow = reinterpret_cast<HWND>(winId());
