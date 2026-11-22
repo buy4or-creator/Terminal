@@ -219,3 +219,106 @@ struct VtScreen {
 #ifdef Q_OS_WIN
 struct ConPtyState { HPCON hPC = nullptr; HANDLE hPipeInWrite = INVALID_HANDLE_VALUE, hPipeOutRead = INVALID_HANDLE_VALUE, hProcess = INVALID_HANDLE_VALUE; std::atomic_bool running{false}; VtScreen screen; };
 static QHash<const TerminalBackend *, ConPtyState *> g_states;
+
+#endif
+}
+
+TerminalBackend::TerminalBackend(QObject *parent) : QObject(parent) {}
+TerminalBackend::~TerminalBackend() { stop(); }
+bool TerminalBackend::usingFallback() const { return false; }
+bool TerminalBackend::isRunning() const {
+#ifdef Q_OS_WIN
+    if (auto *st = g_states.value(this, nullptr); st && st->running.load()) return true;
+#endif
+    return process_ && process_->state() == QProcess::Running;
+}
+QProcess *TerminalBackend::process() const { return process_; }
+
+bool TerminalBackend::start(const QString &shell, const QSize &terminalSize, bool elevated) {
+    stop();
+#ifdef Q_OS_WIN
+    const bool ps = shell.compare(QStringLiteral("powershell"), Qt::CaseInsensitive) == 0;
+    const QString exe = ps ? QStringLiteral("powershell.exe") : QStringLiteral("cmd.exe");
+    const QString args = ps ? QStringLiteral("-NoLogo -NoExit") : QStringLiteral("/K prompt %USERNAME%@%COMPUTERNAME%:$P$G ");
+    if (elevated) { ShellExecuteW(nullptr, L"runas", reinterpret_cast<LPCWSTR>(exe.utf16()), reinterpret_cast<LPCWSTR>(args.utf16()), nullptr, SW_SHOWNORMAL); elevated_ = true; return true; }
+    auto &api = conPtyApi();
+    HANDLE hInR = INVALID_HANDLE_VALUE, hInW = INVALID_HANDLE_VALUE, hOutR = INVALID_HANDLE_VALUE, hOutW = INVALID_HANDLE_VALUE;
+    if (api.create && CreatePipe(&hInR, &hInW, nullptr, 0) && CreatePipe(&hOutR, &hOutW, nullptr, 0)) {
+        COORD size{static_cast<SHORT>(qMax(120, terminalSize.width())), static_cast<SHORT>(qMax(15, terminalSize.height()))};
+        HPCON hPC = nullptr;
+        if (SUCCEEDED(api.create(size, hInR, hOutW, 0, &hPC))) {
+            SIZE_T attrSize = 0; InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize); std::vector<BYTE> attrBuf(attrSize);
+            auto *attrList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data()); InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize);
+            UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, hPC, sizeof(HPCON), nullptr, nullptr);
+            STARTUPINFOEXW si{}; si.StartupInfo.cb = sizeof(STARTUPINFOEXW); si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE; si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE; si.StartupInfo.hStdError = INVALID_HANDLE_VALUE; si.lpAttributeList = attrList;
+            PROCESS_INFORMATION pi{}; QString fullCmd = ps ? QStringLiteral("powershell.exe -NoLogo -NoExit") : QStringLiteral("cmd.exe");
+            std::vector<wchar_t> cmdBuf(fullCmd.size() + 1, 0); fullCmd.toWCharArray(cmdBuf.data());
+            BOOL ok = CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, &si.StartupInfo, &pi);
+            DeleteProcThreadAttributeList(attrList); CloseHandle(hInR); CloseHandle(hOutW);
+            if (ok) {
+                CloseHandle(pi.hThread); auto *st = new ConPtyState{hPC, hInW, hOutR, pi.hProcess, {true}, VtScreen(size.X, size.Y)}; g_states.insert(this, st);
+                QPointer<TerminalBackend> guard(this);
+                QThread *reader = QThread::create([guard, st] {
+                    QByteArray buf(4096, 0); DWORD readBytes = 0;
+                    while (st->running.load() && ReadFile(st->hPipeOutRead, buf.data(), buf.size(), &readBytes, nullptr) && readBytes > 0) {
+                        QByteArray raw = buf.left(static_cast<int>(readBytes));
+                        QString html = st->screen.feed(QString::fromUtf8(raw));
+                        if (guard) QMetaObject::invokeMethod(guard, [guard, raw, html] { if (guard) { emit guard->outputReady(raw); emit guard->outputText(html); } }, Qt::QueuedConnection);
+                    }
+                    if (guard) QMetaObject::invokeMethod(guard, [guard] { if (guard) emit guard->processFinished(0); }, Qt::QueuedConnection);
+                });
+                connect(reader, &QThread::finished, reader, &QObject::deleteLater); reader->start();
+                if (!ps) { DWORD w=0; const char* init="prompt %USERNAME%@%COMPUTERNAME%:$P$G \r\n"; WriteFile(hInW, init, (DWORD)strlen(init), &w, nullptr); FlushFileBuffers(hInW); }
+                return true;
+            }
+            if (api.close) api.close(hPC);
+        }
+        CloseHandle(hInW); CloseHandle(hOutR);
+    }
+#else
+    Q_UNUSED(shell); Q_UNUSED(elevated); Q_UNUSED(terminalSize);
+    process_ = new QProcess(this);
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    env.insert(QStringLiteral("TERM"), QStringLiteral("xterm-256color"));
+    process_->setProcessEnvironment(env);
+    process_->setProcessChannelMode(QProcess::MergedChannels);
+    connect(process_, &QProcess::readyReadStandardOutput, this, [this] {
+        const QByteArray raw = process_->readAllStandardOutput();
+        emit outputReady(raw); emit outputText(QString::fromUtf8(raw));
+    });
+    connect(process_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this](int code, QProcess::ExitStatus) { emit processFinished(code); });
+    process_->start(QStringLiteral("/usr/bin/script"), {QStringLiteral("-qfc"), QStringLiteral("/bin/bash -l"), QStringLiteral("/dev/null")});
+    return process_->waitForStarted(2000);
+#endif
+    return false;
+}
+
+void TerminalBackend::writeInput(const QByteArray &data) {
+#ifdef Q_OS_WIN
+    if (auto *st = g_states.value(this, nullptr); st && st->running.load() && st->hPipeInWrite != INVALID_HANDLE_VALUE) {
+        DWORD written = 0; WriteFile(st->hPipeInWrite, data.constData(), static_cast<DWORD>(data.size()), &written, nullptr); FlushFileBuffers(st->hPipeInWrite); return;
+    }
+#else
+    if (process_ && process_->state() == QProcess::Running) process_->write(data);
+#endif
+}
+void TerminalBackend::sendCommand(const QString &command) { writeInput((command + QStringLiteral("\r")).toUtf8()); }
+void TerminalBackend::resizeTerminal(const QSize &s) {
+#ifdef Q_OS_WIN
+    if (auto *st = g_states.value(this, nullptr); st && st->hPC && conPtyApi().resize) { st->screen.resize(s.width(), s.height()); conPtyApi().resize(st->hPC, {static_cast<SHORT>(qMax(110, s.width())), static_cast<SHORT>(qMax(15, s.height()))}); }
+#else
+    Q_UNUSED(s);
+#endif
+}
+void TerminalBackend::stop() {
+#ifdef Q_OS_WIN
+    if (auto *st = g_states.take(this)) {
+        st->running.store(false); if (st->hPC && conPtyApi().close) conPtyApi().close(st->hPC);
+        if (st->hPipeInWrite != INVALID_HANDLE_VALUE) CloseHandle(st->hPipeInWrite); if (st->hPipeOutRead != INVALID_HANDLE_VALUE) CloseHandle(st->hPipeOutRead);
+        if (st->hProcess != INVALID_HANDLE_VALUE) { TerminateProcess(st->hProcess, 0); CloseHandle(st->hProcess); } delete st;
+    }
+#else
+    if (process_) { process_->kill(); process_->waitForFinished(500); process_->deleteLater(); process_ = nullptr; }
+#endif
+}
