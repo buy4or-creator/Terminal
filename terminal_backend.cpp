@@ -276,18 +276,34 @@ bool TerminalBackend::start(const QString &shell, const QSize &terminalSize, boo
         CloseHandle(hInW); CloseHandle(hOutR);
     }
 #else
-    Q_UNUSED(shell); Q_UNUSED(elevated); Q_UNUSED(terminalSize);
+    Q_UNUSED(shell); Q_UNUSED(elevated);
+    static QHash<const TerminalBackend *, VtScreen *> g_linuxScreens;
+    if (auto *old = g_linuxScreens.take(this)) delete old;
+    auto *scr = new VtScreen(terminalSize.width(), terminalSize.height());
+    g_linuxScreens.insert(this, scr);
+
     process_ = new QProcess(this);
     QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
     env.insert(QStringLiteral("TERM"), QStringLiteral("xterm-256color"));
+    env.insert(QStringLiteral("COLUMNS"), QString::number(qMax(40, terminalSize.width())));
+    env.insert(QStringLiteral("LINES"), QString::number(qMax(15, terminalSize.height())));
     process_->setProcessEnvironment(env);
     process_->setProcessChannelMode(QProcess::MergedChannels);
-    connect(process_, &QProcess::readyReadStandardOutput, this, [this] {
+    connect(process_, &QProcess::readyReadStandardOutput, this, [this, scr] {
         const QByteArray raw = process_->readAllStandardOutput();
-        emit outputReady(raw); emit outputText(QString::fromUtf8(raw));
+        emit outputReady(raw);
+        emit outputText(scr->feed(QString::fromUtf8(raw)));
     });
-    connect(process_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this](int code, QProcess::ExitStatus) { emit processFinished(code); });
-    process_->start(QStringLiteral("/usr/bin/script"), {QStringLiteral("-qfc"), QStringLiteral("/bin/bash -l"), QStringLiteral("/dev/null")});
+    connect(process_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this](int code, QProcess::ExitStatus) {
+        if (auto *s = g_linuxScreens.take(this)) delete s;
+        emit processFinished(code);
+    });
+    const QString userShell = qEnvironmentVariable("SHELL", QStringLiteral("/bin/bash"));
+    const QString cmd = QStringLiteral("stty cols %1 rows %2 2>/dev/null; exec %3 -l")
+                            .arg(qMax(40, terminalSize.width()))
+                            .arg(qMax(15, terminalSize.height()))
+                            .arg(userShell);
+    process_->start(QStringLiteral("/usr/bin/script"), {QStringLiteral("-qfc"), cmd, QStringLiteral("/dev/null")});
     return process_->waitForStarted(2000);
 #endif
     return false;
@@ -302,7 +318,7 @@ void TerminalBackend::writeInput(const QByteArray &data) {
     if (process_ && process_->state() == QProcess::Running) process_->write(data);
 #endif
 }
-void TerminalBackend::sendCommand(const QString &command) { writeInput((command + QStringLiteral("\r")).toUtf8()); }
+void TerminalBackend::sendCommand(const QString &command) { writeInput((command + QStringLiteral("\n")).toUtf8()); }
 void TerminalBackend::resizeTerminal(const QSize &s) {
 #ifdef Q_OS_WIN
     if (auto *st = g_states.value(this, nullptr); st && st->hPC && conPtyApi().resize) { st->screen.resize(s.width(), s.height()); conPtyApi().resize(st->hPC, {static_cast<SHORT>(qMax(110, s.width())), static_cast<SHORT>(qMax(15, s.height()))}); }

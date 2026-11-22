@@ -235,7 +235,15 @@ QPushButton *button(const QString &text, QWidget *parent, const QString &objectN
 
 QString shellLabel(const QString &shell)
 {
-    return shell == QStringLiteral("powershell") ? QStringLiteral("PowerShell") : QStringLiteral("CMD");
+    return shell == QStringLiteral("powershell") ? #ifdef Q_OS_WIN
+QStringLiteral("PowerShell")
+#else
+QStringLiteral("Default Shell")
+#endif : #ifdef Q_OS_WIN
+QStringLiteral("CMD")
+#else
+QStringLiteral("Bash")
+#endif;
 }
 
 
@@ -848,7 +856,15 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     actualDrawerLayout->addWidget(drawerTitle);
     auto *shellGrid = new QGridLayout;
     shellGrid->setSpacing(6);
-    const QStringList shellNames{QStringLiteral("CMD"), QStringLiteral("PowerShell"), QStringLiteral("CMD Admin"), QStringLiteral("PS Admin")};
+    const QStringList shellNames{#ifdef Q_OS_WIN
+QStringLiteral("CMD")
+#else
+QStringLiteral("Bash")
+#endif, #ifdef Q_OS_WIN
+QStringLiteral("PowerShell")
+#else
+QStringLiteral("Default Shell")
+#endif, QStringLiteral("CMD Admin"), QStringLiteral("PS Admin")};
     for (int i = 0; i < shellNames.size(); ++i) {
         auto *shellButton = button(shellNames.at(i), drawerContent_);
         shellGrid->addWidget(shellButton, i / 2, i % 2);
@@ -1017,7 +1033,11 @@ void MainWindow::createConsole()
     auto *toolbar = new QHBoxLayout;
     session->title = new QLineEdit(QStringLiteral("Terminal %1").arg(sessions_.size() + 1), card);
     session->title->setMaximumWidth(260);
-    session->shellBadge = new QLabel(QStringLiteral("CMD"), card);
+    session->shellBadge = new QLabel(#ifdef Q_OS_WIN
+QStringLiteral("CMD")
+#else
+QStringLiteral("Bash")
+#endif, card);
     session->shellBadge->setStyleSheet(QStringLiteral("background:rgba(255,255,255,0.08);border-radius:8px;padding:5px 9px;font-weight:600;"));
     session->status = new QLabel(QStringLiteral("Starting"), card);
     session->status->setObjectName(QStringLiteral("muted"));
