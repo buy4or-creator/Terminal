@@ -219,7 +219,6 @@ struct VtScreen {
 #ifdef Q_OS_WIN
 struct ConPtyState { HPCON hPC = nullptr; HANDLE hPipeInWrite = INVALID_HANDLE_VALUE, hPipeOutRead = INVALID_HANDLE_VALUE, hProcess = INVALID_HANDLE_VALUE; std::atomic_bool running{false}; VtScreen screen; };
 static QHash<const TerminalBackend *, ConPtyState *> g_states;
-
 #endif
 }
 
