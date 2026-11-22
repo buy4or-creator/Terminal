@@ -4,6 +4,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-linux:
     runs-on: ubuntu-24.04
@@ -21,8 +24,8 @@ jobs:
           cp console-v1 dist/Terminal-Linux-x64/Terminal
           cp app.ico dist/Terminal-Linux-x64/
           tar -czvf Terminal-Linux-x64.tar.gz -C dist Terminal-Linux-x64
-      - name: Upload Linux Artifact
-        uses: actions/upload-artifact@v4
+      - name: Attach to GitHub Release v1.1.0
+        uses: softprops/action-gh-release@v2
         with:
-          name: Terminal-Linux-x64
-          path: Terminal-Linux-x64.tar.gz
+          tag_name: v1.1.0
+          files: Terminal-Linux-x64.tar.gz
