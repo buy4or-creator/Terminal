@@ -1,4 +1,4 @@
-﻿name: Build Linux Release
+name: Build Linux Release
 on:
   push:
     branches: [ main ]
@@ -14,12 +14,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential qmake6 qt6-base-dev qt6-tools-dev libgl1-mesa-dev
       - name: Build
         run: |
-          ls -la
-          qmake6 *.pro CONFIG+=release
+          qmake6 console-v1.pro CONFIG+=release
           make -j4
           mkdir -p dist/Terminal-Linux-x64
-          cp console-v1 dist/Terminal-Linux-x64/Terminal || cp Terminal dist/Terminal-Linux-x64/Terminal
-          cp app.ico dist/Terminal-Linux-x64/ 2>/dev/null || true
+          cp console-v1 dist/Terminal-Linux-x64/Terminal
+          cp app.ico dist/Terminal-Linux-x64/
           tar -czvf Terminal-Linux-x64.tar.gz -C dist Terminal-Linux-x64
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
