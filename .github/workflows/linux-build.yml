@@ -3,20 +3,16 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
-
 permissions:
   contents: write
-
 jobs:
   build-linux:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install Qt6 dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential qt6-base-dev libgl1-mesa-dev
-      - name: Build Terminal for Linux
+      - name: Install Qt6
+        run: sudo apt-get update && sudo apt-get install -y build-essential qt6-base-dev qt6-base-dev-tools libgl1-mesa-dev
+      - name: Build
         run: |
           qmake6 console-v1.pro CONFIG+=release
           make -j$(nproc)
@@ -24,7 +20,7 @@ jobs:
           cp console-v1 dist/Terminal-Linux-x64/Terminal
           cp app.ico dist/Terminal-Linux-x64/
           tar -czvf Terminal-Linux-x64.tar.gz -C dist Terminal-Linux-x64
-      - name: Attach to GitHub Release v1.1.0
+      - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.1.0
