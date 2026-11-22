@@ -10,9 +10,17 @@
 
 ### Linux (x64)
 1. Скачайте **Terminal-Linux-x64.tar.gz** из раздела **Releases**.
-2. Установите зависимости Qt 6 (для Ubuntu/Debian) и запустите:
+2. Установите базовые пакеты Qt 6 для вашего дистрибутива:
+   - **Ubuntu / Debian / Mint**:
+     ```bash
+     sudo apt update && sudo apt install -y libqt6widgets6 libqt6gui6 libqt6core6
+     ```
+   - **Arch Linux / Manjaro / EndeavourOS**:
+     ```bash
+     sudo pacman -S --needed qt6-base
+     ```
+3. Распакуйте архив и запустите:
 ```bash
-sudo apt install -y libqt6widgets6 libqt6gui6 libqt6core6
 tar -xzf Terminal-Linux-x64.tar.gz
 cd Terminal-Linux-x64
 ./Terminal
