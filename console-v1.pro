@@ -1,4 +1,4 @@
-QT += core gui widgets
+﻿QT += core gui widgets
 
 CONFIG += c++17
 
@@ -15,4 +15,3 @@ win32: LIBS += -ldwmapi -luser32
 
 RC_ICONS = app.ico
 
-unix:LIBS += -lutil
