@@ -14,3 +14,5 @@ HEADERS += \
 win32: LIBS += -ldwmapi -luser32
 
 RC_ICONS = app.ico
+
+unix:LIBS += -lutil
