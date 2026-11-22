@@ -1,4 +1,4 @@
-﻿#include "terminal_backend.h"
+#include "terminal_backend.h"
 #include <QHash>
 #include <QPointer>
 #include <QSettings>
