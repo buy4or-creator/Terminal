@@ -1166,7 +1166,9 @@ protected:
             resizing_ = true; resizeStart_ = event->scenePos(); resizeStartWidth_ = width_; resizeStartHeight_ = height_; event->accept(); return;
         }
         if (event->button() == Qt::LeftButton && event->pos().y() < 42 && event->pos().x() >= width_-36) {
-            if (deleteRequested) deleteRequested(this); event->accept(); return;
+            if (deleteRequested) deleteRequested(this);
+            event->accept();
+            return;
         }
         if ((isVideo_ || isAudio_) && event->button() == Qt::LeftButton && event->pos().y() >= 44 && event->pos().x() >= 8 && event->pos().x() < width_ - 14 && event->pos().y() < height_ - 14) {
             const QRectF mediaRect(14, 50, qMax(40.0, width_ - 28.0), qMax(40.0, height_ - 66.0));
@@ -1479,16 +1481,37 @@ protected:
     }
     void mousePressEventInner(QMouseEvent *event)
     {
-        const bool linkGesture = (linkMode_ && event->button() == Qt::LeftButton);
-        if(linkGesture){
-            if(NoteCard *card=cardAt(event->position().toPoint())){
-                if(hasLinkStart&&!hasLinkStart()&&startLinkAt)startLinkAt(card);
-                linkGestureActive_=true;
-                linkGestureSource_=card;
+        if (linkMode_ && (event->button() == Qt::RightButton || event->button() == Qt::MiddleButton)) {
+            if (cancelLink) cancelLink();
+            linkGestureActive_ = false;
+            linkGestureSource_ = nullptr;
+            event->accept();
+            return;
+        }
+        if (linkMode_ && event->button() == Qt::LeftButton) {
+            if (NoteCard *card = cardAt(event->position().toPoint())) {
+                if (hasLinkStart && hasLinkStart()) {
+                    if (isLinkStart && !isLinkStart(card) && linkAt) {
+                        linkAt(card);
+                    } else if (cancelLink) {
+                        cancelLink();
+                    }
+                    linkGestureActive_ = false;
+                    linkGestureSource_ = nullptr;
+                } else {
+                    if (startLinkAt) startLinkAt(card);
+                    linkGestureActive_ = true;
+                    linkGestureSource_ = card;
+                }
+                event->accept();
+                return;
+            } else if (cancelLink) {
+                cancelLink();
+                linkGestureActive_ = false;
+                linkGestureSource_ = nullptr;
                 event->accept();
                 return;
             }
-            if((event->button()==Qt::RightButton||event->button()==Qt::MiddleButton)&&cancelLink)cancelLink();
         }
         if(selectMode_&&event->button()==Qt::LeftButton){
             QGraphicsItem *hit=itemAt(event->position().toPoint());
@@ -2683,7 +2706,8 @@ void MainWindow::handleSftpPrompt(const QString &response)
         sftpReady_ = true;
         sftpConnected_ = true;
         if (sshExplorerCard_) {
-            if (auto *p = sshExplorerCard_->findChild<QWidget *>(QStringLiteral("sftpAuthPanel"))) p->setVisible(false); if (auto *b = sshExplorerCard_->findChild<QWidget *>(QStringLiteral("sftpExplorerBody"))) b->setVisible(true);
+            if (auto *p = sshExplorerCard_->findChild<QWidget *>(QStringLiteral("sftpAuthPanel"))) p->setVisible(false);
+            if (auto *b = sshExplorerCard_->findChild<QWidget *>(QStringLiteral("sftpExplorerBody"))) b->setVisible(true);
             if (auto *s = sshExplorerCard_->findChild<QPushButton *>(QStringLiteral("sftpSwitchAccount"))) s->setVisible(true);
         }
         if (sshExplorerStatus_) sshExplorerStatus_->setText(QStringLiteral("Авторизовано · получаю каталог…"));
@@ -3968,7 +3992,8 @@ void MainWindow::buildSettingsPage()
                 *targetVar = hex;
                 QSettings st(QString::fromLatin1(kSettingsOrg), QString::fromLatin1(kSettingsApp));
                 st.setValue(settingKey, hex);
-                if (noteScene_) noteScene_->update(); if (notesPreview) notesPreview->update();
+                if (noteScene_) noteScene_->update();
+                if (notesPreview) notesPreview->update();
             });
             grp->addButton(btn);
             row->addWidget(btn);
