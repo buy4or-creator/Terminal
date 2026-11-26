@@ -1,11 +1,12 @@
-﻿#include <QDesktopServices>
+﻿#include <QShortcut>
+#include <QDesktopServices>
 #include <QUrl>
 #include <QHash>
 static QHash<QString, QString> s_sftpSessionPasswords;
 #include "mainwindow.h"
 static QStringList s_sftpBackHistory;
 static QStringList s_sftpForwardHistory;
-static QString s_sftpCutRemotePath;
+static QStringList s_sftpCutRemotePaths;
 
 
 #include <QApplication>
@@ -2431,12 +2432,55 @@ void MainWindow::openSshExplorer(ConsoleSession *session)
         sshExplorerTree_ = new QTreeWidget(explorerBody);
         sshExplorerTree_->setColumnCount(3);
         sshExplorerTree_->setHeaderLabels({QStringLiteral("Name"), QStringLiteral("Size"), QStringLiteral("Permissions")});
-        sshExplorerTree_->setRootIsDecorated(false); sshExplorerTree_->setAlternatingRowColors(false);
+        sshExplorerTree_->setRootIsDecorated(false); sshExplorerTree_->setAlternatingRowColors(false); sshExplorerTree_->setSelectionMode(QAbstractItemView::ExtendedSelection);
         sshExplorerTree_->setStyleSheet(QStringLiteral("QTreeWidget{background:rgba(14,17,24,0.55);border:0;padding:4px;font-size:13px;}QTreeWidget::item{height:32px;border-radius:6px;padding-left:4px;}QTreeWidget::item:hover{background:rgba(255,255,255,0.06);}QTreeWidget::item:selected{background:rgba(126,184,218,0.22);color:#fff;}QHeaderView::section{background:transparent;border:0;border-bottom:1px solid rgba(255,255,255,0.07);padding:7px 10px;color:rgba(235,240,248,0.6);font-weight:500;}"));
         sshExplorerTree_->header()->setSectionResizeMode(0, QHeaderView::Stretch);
         sshExplorerTree_->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
         sshExplorerTree_->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
         splitRow->addWidget(sshExplorerTree_, 1);
+        auto addExpKey = [this](const QKeySequence &seq, auto fn) {
+            auto *sc = new QShortcut(seq, sshExplorerTree_);
+            sc->setContext(Qt::WidgetWithChildrenShortcut);
+            connect(sc, &QShortcut::activated, this, fn);
+        };
+        addExpKey(QKeySequence::SelectAll, [this] { sshExplorerTree_->selectAll(); });
+        addExpKey(QKeySequence(Qt::Key_F5), [this] { refreshSshExplorer(); });
+        addExpKey(QKeySequence(Qt::Key_Backspace), [this] { navigateSftpParent(); });
+        addExpKey(QKeySequence(Qt::ALT | Qt::Key_Left), [backBtn] { backBtn->click(); });
+        addExpKey(QKeySequence(Qt::ALT | Qt::Key_Right), [fwdBtn] { fwdBtn->click(); });
+        addExpKey(QKeySequence::Cut, [cutBtn] { cutBtn->click(); });
+        addExpKey(QKeySequence::Paste, [pasteHereBtn] { if (pasteHereBtn->isVisible()) pasteHereBtn->click(); });
+        addExpKey(QKeySequence(Qt::Key_F2), [this] {
+            QTreeWidgetItem *it = sshExplorerTree_->currentItem();
+            if (!it) return;
+            const QString remote = it->data(0, Qt::UserRole).toString();
+            const QString base = QFileInfo(remote).fileName();
+            bool ok = false;
+            const QString next = QInputDialog::getText(this, QStringLiteral("Переименовать"), QStringLiteral("Новое имя:"), QLineEdit::Normal, base, &ok).trimmed();
+            if (ok && !next.isEmpty() && next != base) {
+                const QString dst = QDir::cleanPath(QDir(QFileInfo(remote).path()).filePath(next));
+                startSftpTransfer({QStringLiteral("rename %1 %2").arg(sftpQuote(remote), sftpQuote(dst))}, QStringLiteral("Переименовано в %1").arg(next));
+            }
+        });
+        addExpKey(QKeySequence::Delete, [this] {
+            const QList<QTreeWidgetItem *> items = sshExplorerTree_->selectedItems();
+            if (items.isEmpty()) return;
+            const QString label = items.size() == 1 ? QStringLiteral("«%1»").arg(items.first()->text(0)) : QStringLiteral("%1 элементов").arg(items.size());
+            if (QMessageBox::question(this, QStringLiteral("Удаление"), QStringLiteral("Удалить %1?").arg(label)) != QMessageBox::Yes) return;
+            QStringList sftpRm;
+            QStringList rmDirs;
+            for (QTreeWidgetItem *it : items) {
+                const QString rem = it->data(0, Qt::UserRole).toString();
+                const bool isDir = it->data(0, Qt::UserRole + 1).toBool() || it->text(2).startsWith(QLatin1Char('d'));
+                if (isDir) rmDirs.append(sftpQuote(rem));
+                else sftpRm.append(QStringLiteral("rm %1").arg(sftpQuote(rem)));
+            }
+            if (!rmDirs.isEmpty() && sshExplorerSession_ && sshExplorerSession_->backend) {
+                sshExplorerSession_->backend->writeInput(QStringLiteral("rm -rf %1\r").arg(rmDirs.join(QLatin1Char(' '))).toUtf8());
+            }
+            if (!sftpRm.isEmpty()) startSftpTransfer(sftpRm, QStringLiteral("Удалено: %1").arg(label));
+            else QTimer::singleShot(800, this, [this] { refreshSshExplorer(); });
+        });
         sshExplorerTree_->setContextMenuPolicy(Qt::CustomContextMenu);
         connect(sshExplorerTree_, &QTreeWidget::customContextMenuRequested, this, [this, pasteHereBtn](const QPoint &pos) {
             if (!sshExplorerSession_) return;
@@ -2500,7 +2544,7 @@ void MainWindow::openSshExplorer(ConsoleSession *session)
 
                 QAction *actCut = menu.addAction(QStringLiteral("✂  Вырезать"));
                 connect(actCut, &QAction::triggered, this, [this, remote, baseName, pasteHereBtn] {
-                    s_sftpCutRemotePath = remote;
+                    s_sftpCutRemotePaths = {remote};
                     pasteHereBtn->setVisible(true);
                     if (sshExplorerStatus_) sshExplorerStatus_->setText(QStringLiteral("Вырезано: %1").arg(baseName));
                 });
@@ -2530,16 +2574,16 @@ void MainWindow::openSshExplorer(ConsoleSession *session)
                 });
             }
 
-            if (!s_sftpCutRemotePath.isEmpty()) {
+            if (!s_sftpCutRemotePaths.isEmpty()) {
                 if (item) menu.addSeparator();
-                QAction *actPaste = menu.addAction(QStringLiteral("📋  Вставить сюда (%1)").arg(QFileInfo(s_sftpCutRemotePath).fileName()));
+                QAction *actPaste = menu.addAction(QStringLiteral("📋  Вставить сюда (%1)").arg(QString::number(s_sftpCutRemotePaths.size())));
                 connect(actPaste, &QAction::triggered, this, [this, pasteHereBtn] {
                     if (!sshExplorerSession_ || s_sftpCutRemotePath.isEmpty()) return;
                     QString dir = sshExplorerPath_->text().trimmed();
                     if (dir.isEmpty()) dir = sshExplorerSession_->remoteDirectory;
-                    const QString src = s_sftpCutRemotePath;
+                    const QString src = s_sftpCutRemotePaths.first();
                     const QString dst = QDir::cleanPath(QDir(dir).filePath(QFileInfo(src).fileName()));
-                    s_sftpCutRemotePath.clear();
+                    s_sftpCutRemotePaths.clear();
                     pasteHereBtn->setVisible(false);
                     startSftpTransfer({QStringLiteral("rename %1 %2").arg(sftpQuote(src), sftpQuote(dst))}, QStringLiteral("Перемещено в %1").arg(dir));
                 });
@@ -2651,15 +2695,23 @@ void MainWindow::openSshExplorer(ConsoleSession *session)
             }
         });
         connect(cutBtn, &QPushButton::clicked, this, [this, pasteHereBtn] {
-            const QString sel = selectedRemotePath(); if (sel.isEmpty()) { sshExplorerStatus_->setText(QStringLiteral("Выберите элемент")); return; }
-            s_sftpCutRemotePath = sel; pasteHereBtn->setVisible(true); sshExplorerStatus_->setText(QStringLiteral("Вырезано: %1").arg(QFileInfo(sel).fileName()));
+            const QList<QTreeWidgetItem *> items = sshExplorerTree_->selectedItems();
+            if (items.isEmpty()) { sshExplorerStatus_->setText(QStringLiteral("Выберите элементы")); return; }
+            s_sftpCutRemotePaths.clear();
+            for (QTreeWidgetItem *it : items) s_sftpCutRemotePaths.append(it->data(0, Qt::UserRole).toString());
+            pasteHereBtn->setVisible(true);
+            sshExplorerStatus_->setText(QStringLiteral("Вырезано элементов: %1").arg(s_sftpCutRemotePaths.size()));
         });
         connect(pasteHereBtn, &QPushButton::clicked, this, [this, pasteHereBtn] {
-            if (!sshExplorerSession_ || s_sftpCutRemotePath.isEmpty()) return;
+            if (!sshExplorerSession_ || s_sftpCutRemotePaths.isEmpty()) return;
             QString dir = sshExplorerPath_->text().trimmed(); if (dir.isEmpty()) dir = sshExplorerSession_->remoteDirectory;
-            const QString dst = QDir::cleanPath(QDir(dir).filePath(QFileInfo(s_sftpCutRemotePath).fileName()));
-            s_sftpCutRemotePath.clear(); pasteHereBtn->setVisible(false);
-            startSftpTransfer({QStringLiteral("rename %1 %2").arg(sftpQuote(s_sftpCutRemotePath), sftpQuote(dst))}, QStringLiteral("Перемещено в %1").arg(dir));
+            QStringList cmds;
+            for (const QString &src : s_sftpCutRemotePaths) {
+                const QString dst = QDir::cleanPath(QDir(dir).filePath(QFileInfo(src).fileName()));
+                cmds.append(QStringLiteral("rename %1 %2").arg(sftpQuote(src), sftpQuote(dst)));
+            }
+            s_sftpCutRemotePaths.clear(); pasteHereBtn->setVisible(false);
+            startSftpTransfer(cmds, QStringLiteral("Перемещено в %1").arg(dir));
         });
         
         connect(sshExplorerTree_, &QTreeWidget::itemActivated, this, [this](QTreeWidgetItem *item, int) {
