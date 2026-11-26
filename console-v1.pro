@@ -11,7 +11,11 @@ HEADERS += \
     mainwindow.h \
     terminal_backend.h
 
-win32: LIBS += -ldwmapi -luser32
+win32 {
+    DEFINES += _WIN32_WINNT=0x0A00 NTDDI_VERSION=0x0A000006
+    LIBS += -ldwmapi -luser32 -lkernel32
+}
+
+unix: LIBS += -lutil
 
 RC_ICONS = app.ico
-

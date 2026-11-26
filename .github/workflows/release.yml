@@ -1,0 +1,71 @@
+﻿name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Qt 6.8 (MinGW)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: 'windows'
+          target: 'desktop'
+          arch: 'win64_mingw'
+      - name: Build Release
+        shell: pwsh
+        run: |
+          qmake console-v1.pro CONFIG+=release
+          mingw32-make -f Makefile.Release -j4
+          New-Item -ItemType Directory -Path dist\Terminal-Windows-x64 -Force | Out-Null
+          Copy-Item release\console-v1.exe dist\Terminal-Windows-x64\Terminal.exe
+          windeployqt --release dist\Terminal-Windows-x64\Terminal.exe
+          Compress-Archive -Path dist\Terminal-Windows-x64\* -DestinationPath Terminal-${{ github.ref_name }}-Windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: Terminal-${{ github.ref_name }}-Windows-x64.zip
+
+  linux-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Qt6
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qt6-base-dev build-essential
+      - name: Build Release
+        run: |
+          qmake6 console-v1.pro CONFIG+=release
+          make -f Makefile.Release -j$(nproc)
+          mkdir -p dist/Terminal-Linux-x64
+          cp release/console-v1 dist/Terminal-Linux-x64/Terminal
+          tar -czf Terminal-${{ github.ref_name }}-Linux-x64.tar.gz -C dist Terminal-Linux-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: Terminal-${{ github.ref_name }}-Linux-x64.tar.gz
+
+  release:
+    needs: [windows-build, linux-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Terminal ${{ github.ref_name }}"
+          prerelease: ${{ contains(github.ref_name, 'beta') }}
+          files: |
+            Terminal-${{ github.ref_name }}-Windows-x64.zip
+            Terminal-${{ github.ref_name }}-Linux-x64.tar.gz

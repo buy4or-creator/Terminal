@@ -1,339 +1,528 @@
 #include "terminal_backend.h"
-#include <QHash>
+
+#include <QMetaObject>
 #include <QPointer>
-#include <QSettings>
-#include <QThread>
-#include <atomic>
+#include <QProcessEnvironment>
+#include <cstring>
 #include <vector>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
 #include <shellapi.h>
-
 #ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
 #define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 0x00020016
 #endif
-
-typedef VOID* HPCON;
-typedef HRESULT (WINAPI *PFN_CreatePseudoConsole)(COORD, HANDLE, HANDLE, DWORD, HPCON*);
-typedef HRESULT (WINAPI *PFN_ResizePseudoConsole)(HPCON, COORD);
-typedef VOID (WINAPI *PFN_ClosePseudoConsole)(HPCON);
-
-namespace {
-struct ConPtyApi { PFN_CreatePseudoConsole create = nullptr; PFN_ResizePseudoConsole resize = nullptr; PFN_ClosePseudoConsole close = nullptr; bool loaded = false; };
-ConPtyApi &conPtyApi() {
-    static ConPtyApi api;
-    if (!api.loaded) {
-        api.loaded = true;
-        if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll")) {
-            api.create = reinterpret_cast<PFN_CreatePseudoConsole>(GetProcAddress(k32, "CreatePseudoConsole"));
-            api.resize = reinterpret_cast<PFN_ResizePseudoConsole>(GetProcAddress(k32, "ResizePseudoConsole"));
-            api.close = reinterpret_cast<PFN_ClosePseudoConsole>(GetProcAddress(k32, "ClosePseudoConsole"));
-        }
-    }
-    return api;
-}
-
+#ifndef _HPCON_DEFINED
+using HPCON = HANDLE;
+#define _HPCON_DEFINED
 #endif
-namespace {
-QString ansiColor(int idx) {
-    static const char *pal[16] = {
-        "#1e1e2e","#f38ba8","#a6e3a1","#f9e2af","#89b4fa","#f5c2e7","#94e2d5","#cdd6f4",
-        "#585b70","#f38ba8","#a6e3a1","#f9e2af","#89b4fa","#f5c2e7","#94e2d5","#ffffff"
-    };
-    if (idx >= 0 && idx < 16) return QString::fromLatin1(pal[idx]);
-    if (idx >= 16 && idx <= 231) {
-        int v = idx - 16, r = (v / 36) ? (v / 36) * 40 + 55 : 0, g = ((v / 6) % 6) ? ((v / 6) % 6) * 40 + 55 : 0, b = (v % 6) ? (v % 6) * 40 + 55 : 0;
-        return QStringLiteral("#%1%2%3").arg(r,2,16,QLatin1Char('0')).arg(g,2,16,QLatin1Char('0')).arg(b,2,16,QLatin1Char('0'));
-    }
-    if (idx >= 232 && idx <= 255) { int g = (idx - 232) * 10 + 8; return QStringLiteral("#%1%2%3").arg(g,2,16,QLatin1Char('0')).arg(g,2,16,QLatin1Char('0')).arg(g,2,16,QLatin1Char('0')); }
-    return QString();
-}
+#else
+#include <cerrno>
+#include <csignal>
+#include <fcntl.h>
+#include <pty.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
-struct Cell { QChar ch = QLatin1Char(' '); QString fg; QString bg; bool bold = false; };
-
-struct VtScreen {
-    int rows = 32, cols = 120, r = 0, c = 0;
-    QString curFg, curBg; bool curBold = false;
-    QVector<QVector<Cell>> grid;
-    QVector<QVector<Cell>> savedGrid;
-    QStringList scrollbackHtml;
-    int savedR = 0, savedC = 0;
-    bool altScreen = false;
-
-    VtScreen(int w = 120, int h = 32) : rows(qMax(15, h)), cols(qMax(40, w)) { grid.fill(QVector<Cell>(cols), rows); }
-
-    QString rowToHtml(const QVector<Cell> &row) const {
-        int last = row.size() - 1;
-        while (last >= 0 && row[last].ch == QLatin1Char(' ') && row[last].bg.isEmpty()) --last;
-        if (last < 0) return QString();
-        QString html, openStyle;
-        for (int x = 0; x <= last; ++x) {
-            const Cell &cell = row[x];
-            QString style;
-            if (!cell.fg.isEmpty()) style += QStringLiteral("color:%1;").arg(cell.fg);
-            if (!cell.bg.isEmpty()) style += QStringLiteral("background-color:%1;").arg(cell.bg);
-            if (cell.bold) style += QStringLiteral("font-weight:700;");
-            if (style != openStyle) {
-                if (!openStyle.isEmpty()) html += QStringLiteral("</span>");
-                if (!style.isEmpty()) html += QStringLiteral("<span style=\"%1\">").arg(style);
-                openStyle = style;
-            }
-            QChar ch = cell.ch;
-            if (ch == QLatin1Char('&')) html += QStringLiteral("&amp;");
-            else if (ch == QLatin1Char('<')) html += QStringLiteral("&lt;");
-            else if (ch == QLatin1Char('>')) html += QStringLiteral("&gt;");
-            else html += ch;
-        }
-        if (!openStyle.isEmpty()) html += QStringLiteral("</span>");
-        return html;
-    }
-
-    void resize(int w, int h) {
-        rows = qMax(15, h); cols = qMax(40, w);
-        while (grid.size() < rows) grid.append(QVector<Cell>(cols));
-        while (grid.size() > rows) scrollbackHtml.append(rowToHtml(grid.takeFirst()));
-        for (int i = 0; i < rows; ++i) grid[i].resize(cols);
-        r = qBound(0, r, rows - 1); c = qBound(0, c, cols - 1);
-    }
-
-    void scrollUp() {
-        scrollbackHtml.append(rowToHtml(grid.takeFirst()));
-        if (scrollbackHtml.size() > 400) scrollbackHtml.removeFirst();
-        grid.append(QVector<Cell>(cols));
-    }
-
-    void putChar(QChar ch) {
-        if (ch == QLatin1Char('\r')) { c = 0; return; }
-        if (ch == QLatin1Char('\n')) { if (++r >= rows) { r = rows - 1; scrollUp(); } return; }
-        if (ch == QLatin1Char('\b')) { if (c > 0) --c; return; }
-        if (ch == QLatin1Char('\t')) { c = qMin(cols - 1, (c + 8) & ~7); return; }
-        if (ch.unicode() < 32) return;
-        if (c >= cols) { c = 0; if (++r >= rows) { r = rows - 1; scrollUp(); } }
-        grid[r][c] = {ch, curFg, curBg, curBold}; ++c;
-    }
-    void applySgr(const QStringList &parts) {
-        if (parts.isEmpty() || (parts.size() == 1 && parts[0].isEmpty())) { curFg.clear(); curBg.clear(); curBold = false; return; }
-        for (int k = 0; k < parts.size(); ++k) {
-            int code = parts[k].toInt();
-            if (code == 0) { curFg.clear(); curBg.clear(); curBold = false; }
-            else if (code == 1) curBold = true;
-            else if (code == 22) curBold = false;
-            else if (code == 39) curFg.clear();
-            else if (code == 49) curBg.clear();
-            else if (code >= 30 && code <= 37) curFg = ansiColor(code - 30 + (curBold ? 8 : 0));
-            else if (code >= 90 && code <= 97) curFg = ansiColor(code - 90 + 8);
-            else if (code >= 40 && code <= 47) curBg = ansiColor(code - 40);
-            else if (code >= 100 && code <= 107) curBg = ansiColor(code - 100 + 8);
-            else if ((code == 38 || code == 48) && k + 2 < parts.size() && parts[k + 1].toInt() == 5) {
-                QString col = ansiColor(parts[k + 2].toInt());
-                if (code == 38) curFg = col; else curBg = col;
-                k += 2;
-            } else if ((code == 38 || code == 48) && k + 4 < parts.size() && parts[k + 1].toInt() == 2) {
-                QString col = QStringLiteral("#%1%2%3").arg(parts[k+2].toInt(),2,16,QLatin1Char('0')).arg(parts[k+3].toInt(),2,16,QLatin1Char('0')).arg(parts[k+4].toInt(),2,16,QLatin1Char('0'));
-                if (code == 38) curFg = col; else curBg = col;
-                k += 4;
-            }
-        }
-    }
-
-    QString feed(const QString &raw) {
-        int i = 0, n = raw.size();
-        while (i < n) {
-            QChar ch = raw.at(i);
-            if (ch == QLatin1Char('\x1b')) {
-                if (i + 1 < n && raw.at(i + 1) == QLatin1Char(']')) {
-                    i += 2; while (i < n) { if (raw.at(i) == QLatin1Char('\x07')) { ++i; break; } if (raw.at(i) == QLatin1Char('\x1b') && i + 1 < n && raw.at(i + 1) == QLatin1Char('\\')) { i += 2; break; } ++i; } continue;
-                }
-                if (i + 1 < n && raw.at(i + 1) == QLatin1Char('[')) {
-                    i += 2; QString params;
-                    while (i < n && (raw.at(i).isDigit() || raw.at(i) == QLatin1Char(';') || raw.at(i) == QLatin1Char('?'))) { params.append(raw.at(i)); ++i; }
-                    if (i < n) {
-                        QChar cmd = raw.at(i++); QString cp = params; cp.remove(QLatin1Char('?'));
-                        const QStringList parts = cp.split(QLatin1Char(';'));
-                        int p1 = parts.value(0).toInt(), p2 = parts.value(1).toInt();
-                                                if (cmd == QLatin1Char('h') && cp == QStringLiteral("1049")) {
-                            if (!altScreen) { savedGrid = grid; savedR = r; savedC = c; altScreen = true; grid.fill(QVector<Cell>(cols), rows); r = 0; c = 0; }
-                        } else if (cmd == QLatin1Char('l') && cp == QStringLiteral("1049")) {
-                            if (altScreen) { grid = savedGrid; r = qBound(0, savedR, rows - 1); c = qBound(0, savedC, cols - 1); altScreen = false; }
-                        } else if (cmd == QLatin1Char('m')) applySgr(parts);
-                        else if (cmd == QLatin1Char('H') || cmd == QLatin1Char('f')) { r = qBound(0, (p1 > 0 ? p1 - 1 : 0), rows - 1); c = qBound(0, (p2 > 0 ? p2 - 1 : 0), cols - 1); }
-                        else if (cmd == QLatin1Char('A')) r = qMax(0, r - qMax(1, p1));
-                        else if (cmd == QLatin1Char('B')) r = qMin(rows - 1, r + qMax(1, p1));
-                        else if (cmd == QLatin1Char('C')) c = qMin(cols - 1, c + qMax(1, p1));
-                        else if (cmd == QLatin1Char('D')) c = qMax(0, c - qMax(1, p1));
-                        else if (cmd == QLatin1Char('G')) c = qBound(0, (p1 > 0 ? p1 - 1 : 0), cols - 1);
-                        else if (cmd == QLatin1Char('J')) {
-                            if (p1 == 2 || p1 == 3) { scrollbackHtml.clear(); for (int k = 0; k < rows; ++k) grid[k] = QVector<Cell>(cols); r = 0; c = 0; }
-                            else if (p1 == 0) { for (int x = c; x < cols; ++x) grid[r][x] = Cell{}; for (int y = r + 1; y < rows; ++y) grid[y] = QVector<Cell>(cols); }
-                        }                         else if (cmd == QLatin1Char('@')) {
-                            int cnt = qMax(1, p1);
-                            for (int s = 0; s < cnt && c < cols; ++s) { grid[r].insert(c, Cell{}); grid[r].resize(cols); }
-                        } else if (cmd == QLatin1Char('P')) {
-                            int cnt = qMax(1, p1);
-                            for (int s = 0; s < cnt && c < cols; ++s) { grid[r].remove(c); grid[r].append(Cell{}); }
-                        } else if (cmd == QLatin1Char('K')) {
-                            if (p1 == 2) grid[r] = QVector<Cell>(cols);
-                            else if (p1 == 1) { for (int x = 0; x <= c && x < cols; ++x) grid[r][x] = Cell{}; }
-                            else { for (int x = c; x < cols; ++x) grid[r][x] = Cell{}; }
-                        }
-                    }
-                    continue;
-                }
-                i += 2; continue;
-            }
-            putChar(ch); ++i;
-        }
-        QStringList out = altScreen ? QStringList{} : scrollbackHtml;         int lastRow = r;
-        for (int y = rows - 1; y >= 0; --y) {
-            bool empty = true; for (const Cell &cell : grid[y]) if (cell.ch != QLatin1Char(' ') || !cell.bg.isEmpty()) { empty = false; break; }
-            if (!empty) { lastRow = qMax(lastRow, y); break; }
-        }
-        for (int y = 0; y <= lastRow; ++y) {
-            if (y == r && c >= 0 && c < cols) {
-                                QSettings cs(QStringLiteral("ConsoleV1"), QStringLiteral("TerminalApp"));
-                const QString cStyle = cs.value(QStringLiteral("cursorStyle"), QStringLiteral("block")).toString();
-                const QString cColor = cs.value(QStringLiteral("cursorColor"), QStringLiteral("#a78bfa")).toString();
-                QVector<Cell> rowWithCursor = grid[y];
-                if (cStyle == QStringLiteral("underline")) {
-                    rowWithCursor[c].fg = cColor;
-                    rowWithCursor[c].bold = true;
-                    if (rowWithCursor[c].ch == QLatin1Char(' ')) rowWithCursor[c].ch = QLatin1Char('_');
-                } else if (cStyle == QStringLiteral("bar")) {
-                    rowWithCursor[c].fg = cColor;
-                    rowWithCursor[c].bold = true;
-                    if (rowWithCursor[c].ch == QLatin1Char(' ')) rowWithCursor[c].ch = QChar(0x258F);
-                } else {
-                    rowWithCursor[c].bg = cColor;
-                    rowWithCursor[c].fg = QStringLiteral("#0b0f17");
-                    rowWithCursor[c].bold = true;
-                }
-                out << rowToHtml(rowWithCursor);
-            } else {
-                out << rowToHtml(grid[y]);
-            }
-        }
-        return QStringLiteral("<pre style=\"margin:0;white-space:pre;\">") + out.join(QLatin1Char('\n')) + QStringLiteral("</pre>");
-    }
+struct TerminalBackend::Impl {
+    QProcess *fallback = nullptr;
+    QProcess *process_ = nullptr;
+    std::atomic_bool running{false};
+    bool fallbackMode = false;
+    bool elevated = false;
+#ifdef Q_OS_WIN
+    using CreateFn = HRESULT (WINAPI *)(COORD, HANDLE, HANDLE, DWORD, HPCON *);
+    using ResizeFn = HRESULT (WINAPI *)(HPCON, COORD);
+    using CloseFn = void (WINAPI *)(HPCON);
+    HPCON hpc = nullptr;
+    CreateFn create = nullptr;
+    ResizeFn resize = nullptr;
+    CloseFn close = nullptr;
+    HANDLE inputWrite = INVALID_HANDLE_VALUE;
+    HANDLE outputRead = INVALID_HANDLE_VALUE;
+    HANDLE processHandle = nullptr;
+#else
+    int master = -1;
+    pid_t child = -1;
+#endif
+    std::thread reader;
+    std::atomic_bool stopReader{false};
 };
+
+namespace {
 #ifdef Q_OS_WIN
-struct ConPtyState { HPCON hPC = nullptr; HANDLE hPipeInWrite = INVALID_HANDLE_VALUE, hPipeOutRead = INVALID_HANDLE_VALUE, hProcess = INVALID_HANDLE_VALUE; std::atomic_bool running{false}; VtScreen screen; };
-static QHash<const TerminalBackend *, ConPtyState *> g_states;
+template <typename Function>
+Function resolveFunction(HMODULE module, const char *name)
+{
+    Function result = nullptr;
+    FARPROC address = GetProcAddress(module, name);
+    static_assert(sizeof(result) == sizeof(address), "Function pointer size mismatch");
+    std::memcpy(&result, &address, sizeof(result));
+    return result;
+}
+void closeHandle(HANDLE &handle)
+{
+    if (handle != nullptr && handle != INVALID_HANDLE_VALUE)
+        CloseHandle(handle);
+    handle = INVALID_HANDLE_VALUE;
+}
+#endif
+
+QString executableFor(const QString &shell)
+{
+#ifdef Q_OS_WIN
+    return shell.compare(QStringLiteral("powershell"), Qt::CaseInsensitive) == 0
+        ? QStringLiteral("powershell.exe")
+        : QStringLiteral("cmd.exe");
+#else
+    if (shell.compare(QStringLiteral("powershell"), Qt::CaseInsensitive) == 0)
+        return QStringLiteral("pwsh");
+    if (shell.compare(QStringLiteral("bash"), Qt::CaseInsensitive) == 0)
+        return QStringLiteral("/bin/bash");
+    if (shell.compare(QStringLiteral("zsh"), Qt::CaseInsensitive) == 0)
+        return QStringLiteral("/bin/zsh");
+    return qEnvironmentVariable("SHELL", QStringLiteral("/bin/bash"));
 #endif
 }
 
-TerminalBackend::TerminalBackend(QObject *parent) : QObject(parent) {}
-TerminalBackend::~TerminalBackend() { stop(); }
-bool TerminalBackend::usingFallback() const { return false; }
-bool TerminalBackend::isRunning() const {
+QStringList argumentsFor(const QString &shell)
+{
 #ifdef Q_OS_WIN
-    if (auto *st = g_states.value(this, nullptr); st && st->running.load()) return true;
+    if (shell.compare(QStringLiteral("powershell"), Qt::CaseInsensitive) == 0) {
+        return {
+            QStringLiteral("-NoLogo"),
+            QStringLiteral("-NoExit"),
+            QStringLiteral("-Command"),
+            QStringLiteral("[Console]::InputEncoding=[System.Text.Encoding]::UTF8;[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;")
+        };
+    }
+    return {QStringLiteral("/Q"), QStringLiteral("/K")};
+#else
+    Q_UNUSED(shell);
+    return {QStringLiteral("-i")};
 #endif
-    return process_ && process_->state() == QProcess::Running;
 }
-QProcess *TerminalBackend::process() const { return process_; }
 
-bool TerminalBackend::start(const QString &shell, const QSize &terminalSize, bool elevated) {
+QByteArray lineEnding()
+{
+#ifdef Q_OS_WIN
+    return QByteArray("\r\n");
+#else
+    return QByteArray("\n");
+#endif
+}
+
+#ifndef Q_OS_WIN
+void applyPtyEnvironment()
+{
+    setenv("TERM", "xterm-256color", 1);
+    setenv("COLORTERM", "truecolor", 1);
+    setenv("LANG", "C.UTF-8", 0);
+}
+#endif
+} // namespace
+
+TerminalBackend::TerminalBackend(QObject *parent)
+    : QObject(parent)
+    , impl_(std::make_unique<Impl>())
+{
+}
+
+TerminalBackend::~TerminalBackend()
+{
+    stop();
+}
+
+bool TerminalBackend::usingFallback() const
+{
+    return impl_->fallbackMode;
+}
+
+bool TerminalBackend::isRunning() const
+{
+    return impl_->running.load();
+}
+
+QProcess *TerminalBackend::process() const
+{
+    return impl_->process_;
+}
+
+bool TerminalBackend::start(const QString &shell, const QSize &terminalSize, bool elevated)
+{
+    return startCommand(executableFor(shell), argumentsFor(shell), terminalSize, elevated);
+}
+
+bool TerminalBackend::startCommand(const QString &program, const QStringList &arguments,
+                                   const QSize &terminalSize, bool elevated)
+{
     stop();
 #ifdef Q_OS_WIN
-    const bool ps = shell.compare(QStringLiteral("powershell"), Qt::CaseInsensitive) == 0;
-    const QString exe = ps ? QStringLiteral("powershell.exe") : QStringLiteral("cmd.exe");
-    const QString args = ps ? QStringLiteral("-NoLogo -NoExit") : QStringLiteral("/K prompt %USERNAME%@%COMPUTERNAME%:$P$G ");
-    if (elevated) { ShellExecuteW(nullptr, L"runas", reinterpret_cast<LPCWSTR>(exe.utf16()), reinterpret_cast<LPCWSTR>(args.utf16()), nullptr, SW_SHOWNORMAL); elevated_ = true; return true; }
-    auto &api = conPtyApi();
-    HANDLE hInR = INVALID_HANDLE_VALUE, hInW = INVALID_HANDLE_VALUE, hOutR = INVALID_HANDLE_VALUE, hOutW = INVALID_HANDLE_VALUE;
-    if (api.create && CreatePipe(&hInR, &hInW, nullptr, 0) && CreatePipe(&hOutR, &hOutW, nullptr, 0)) {
-        COORD size{static_cast<SHORT>(qMax(120, terminalSize.width())), static_cast<SHORT>(qMax(15, terminalSize.height()))};
-        HPCON hPC = nullptr;
-        if (SUCCEEDED(api.create(size, hInR, hOutW, 0, &hPC))) {
-            SIZE_T attrSize = 0; InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize); std::vector<BYTE> attrBuf(attrSize);
-            auto *attrList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data()); InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize);
-            UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, hPC, sizeof(HPCON), nullptr, nullptr);
-            STARTUPINFOEXW si{}; si.StartupInfo.cb = sizeof(STARTUPINFOEXW); si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-            si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE; si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE; si.StartupInfo.hStdError = INVALID_HANDLE_VALUE; si.lpAttributeList = attrList;
-            PROCESS_INFORMATION pi{}; QString fullCmd = ps ? QStringLiteral("powershell.exe -NoLogo -NoExit") : QStringLiteral("cmd.exe");
-            std::vector<wchar_t> cmdBuf(fullCmd.size() + 1, 0); fullCmd.toWCharArray(cmdBuf.data());
-            BOOL ok = CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, &si.StartupInfo, &pi);
-            DeleteProcThreadAttributeList(attrList); CloseHandle(hInR); CloseHandle(hOutW);
-            if (ok) {
-                CloseHandle(pi.hThread); auto *st = new ConPtyState{hPC, hInW, hOutR, pi.hProcess, {true}, VtScreen(size.X, size.Y)}; g_states.insert(this, st);
-                QPointer<TerminalBackend> guard(this);
-                QThread *reader = QThread::create([guard, st] {
-                    QByteArray buf(4096, 0); DWORD readBytes = 0;
-                    while (st->running.load() && ReadFile(st->hPipeOutRead, buf.data(), buf.size(), &readBytes, nullptr) && readBytes > 0) {
-                        QByteArray raw = buf.left(static_cast<int>(readBytes));
-                        QString html = st->screen.feed(QString::fromUtf8(raw));
-                        if (guard) QMetaObject::invokeMethod(guard, [guard, raw, html] { if (guard) { emit guard->outputReady(raw); emit guard->outputText(html); } }, Qt::QueuedConnection);
-                    }
-                    if (guard) QMetaObject::invokeMethod(guard, [guard] { if (guard) emit guard->processFinished(0); }, Qt::QueuedConnection);
-                });
-                connect(reader, &QThread::finished, reader, &QObject::deleteLater); reader->start();
-                if (!ps) { DWORD w=0; const char* init="prompt %USERNAME%@%COMPUTERNAME%:$P$G \r\n"; WriteFile(hInW, init, (DWORD)strlen(init), &w, nullptr); FlushFileBuffers(hInW); }
-                return true;
-            }
-            if (api.close) api.close(hPC);
-        }
-        CloseHandle(hInW); CloseHandle(hOutR);
+    if (elevated) {
+        const QString parameters = arguments.join(QLatin1Char(' '));
+        const HINSTANCE result = ShellExecuteW(
+            nullptr,
+            L"runas",
+            reinterpret_cast<LPCWSTR>(program.utf16()),
+            reinterpret_cast<LPCWSTR>(parameters.utf16()),
+            nullptr,
+            SW_SHOWNORMAL);
+        const INT_PTR code = reinterpret_cast<INT_PTR>(result);
+        if (code <= 32)
+            emit errorOccurred(QStringLiteral("ShellExecute elevated failed (%1)").arg(code));
+        return code > 32;
     }
-#else
-    Q_UNUSED(shell); Q_UNUSED(elevated);
-    static QHash<const TerminalBackend *, VtScreen *> g_linuxScreens;
-    if (auto *old = g_linuxScreens.take(this)) delete old;
-    auto *scr = new VtScreen(terminalSize.width(), terminalSize.height());
-    g_linuxScreens.insert(this, scr);
 
-    process_ = new QProcess(this);
+    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    impl_->create = resolveFunction<Impl::CreateFn>(kernel, "CreatePseudoConsole");
+    impl_->resize = resolveFunction<Impl::ResizeFn>(kernel, "ResizePseudoConsole");
+    impl_->close = resolveFunction<Impl::CloseFn>(kernel, "ClosePseudoConsole");
+    if (!impl_->create || !impl_->resize || !impl_->close)
+        return startFallback(program, arguments, QStringLiteral("ConPTY API unavailable"));
+
+    HANDLE inRead = INVALID_HANDLE_VALUE, inWrite = INVALID_HANDLE_VALUE;
+    HANDLE outRead = INVALID_HANDLE_VALUE, outWrite = INVALID_HANDLE_VALUE;
+    if (!CreatePipe(&inRead, &inWrite, nullptr, 0))
+        return startFallback(program, arguments, QStringLiteral("CreatePipe input error %1").arg(GetLastError()));
+    if (!CreatePipe(&outRead, &outWrite, nullptr, 0)) {
+        const DWORD error = GetLastError();
+        closeHandle(inRead);
+        closeHandle(inWrite);
+        return startFallback(program, arguments, QStringLiteral("CreatePipe output error %1").arg(error));
+    }
+
+    COORD size{
+        static_cast<SHORT>(qBound(2, terminalSize.width(), 300)),
+        static_cast<SHORT>(qBound(2, terminalSize.height(), 120))};
+    const HRESULT hr = impl_->create(size, inRead, outWrite, 0, &impl_->hpc);
+    if (FAILED(hr)) {
+        const DWORD error = GetLastError();
+        closeHandle(inRead);
+        closeHandle(inWrite);
+        closeHandle(outRead);
+        closeHandle(outWrite);
+        return startFallback(
+            program,
+            arguments,
+            QStringLiteral("CreatePseudoConsole HRESULT %1 / error %2")
+                .arg(quint32(hr), 8, 16, QLatin1Char('0'))
+                .arg(error));
+    }
+
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
+    std::vector<BYTE> attrBuffer(attrSize);
+    auto *attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuffer.data());
+    if (!InitializeProcThreadAttributeList(attrs, 1, 0, &attrSize)
+        || !UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, impl_->hpc, sizeof(HPCON), nullptr, nullptr)) {
+        const DWORD error = GetLastError();
+        if (attrs)
+            DeleteProcThreadAttributeList(attrs);
+        closeHandle(inRead);
+        closeHandle(inWrite);
+        closeHandle(outRead);
+        closeHandle(outWrite);
+        impl_->close(impl_->hpc);
+        impl_->hpc = nullptr;
+        return startFallback(program, arguments, QStringLiteral("ConPTY attribute error %1").arg(error));
+    }
+
+    QString command = QLatin1Char('"') + program + QLatin1Char('"');
+    for (const QString &arg : arguments)
+        command += QStringLiteral(" \"") + arg + QLatin1Char('"');
+
+    std::vector<wchar_t> mutableCommand(command.size() + 1, L'\0');
+    command.toWCharArray(mutableCommand.data());
+
+    STARTUPINFOEXW si{};
+    si.StartupInfo.cb = sizeof(STARTUPINFOEXW);
+    si.lpAttributeList = attrs;
+    PROCESS_INFORMATION pi{};
+    const BOOL ok = CreateProcessW(
+        nullptr,
+        mutableCommand.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        EXTENDED_STARTUPINFO_PRESENT,
+        nullptr,
+        nullptr,
+        &si.StartupInfo,
+        &pi);
+    const DWORD createError = ok ? 0 : GetLastError();
+    DeleteProcThreadAttributeList(attrs);
+    if (!ok) {
+        closeHandle(inRead);
+        closeHandle(inWrite);
+        closeHandle(outRead);
+        closeHandle(outWrite);
+        impl_->close(impl_->hpc);
+        impl_->hpc = nullptr;
+        return startFallback(program, arguments, QStringLiteral("CreateProcessW error %1").arg(createError));
+    }
+
+    closeHandle(inRead);
+    closeHandle(outWrite);
+    CloseHandle(pi.hThread);
+    impl_->inputWrite = inWrite;
+    impl_->outputRead = outRead;
+    impl_->processHandle = pi.hProcess;
+#else
+    if (elevated) {
+        emit errorOccurred(QStringLiteral("Elevated shell is Windows-only."));
+        return false;
+    }
+
+    int master = -1;
+    int execStatus[2] = {-1, -1};
+    if (pipe(execStatus) != 0)
+        return startFallback(program, arguments, QStringLiteral("exec status pipe error %1").arg(errno));
+    if (fcntl(execStatus[1], F_SETFD, FD_CLOEXEC) == -1) {
+        const int error = errno;
+        close(execStatus[0]);
+        close(execStatus[1]);
+        return startFallback(program, arguments, QStringLiteral("exec status setup error %1").arg(error));
+    }
+    winsize ws{};
+    ws.ws_col = static_cast<unsigned short>(qBound(2, terminalSize.width(), 300));
+    ws.ws_row = static_cast<unsigned short>(qBound(2, terminalSize.height(), 120));
+    const pid_t pid = forkpty(&master, nullptr, nullptr, &ws);
+    if (pid < 0) {
+        const int error = errno;
+        close(execStatus[0]);
+        close(execStatus[1]);
+        return startFallback(program, arguments, QStringLiteral("forkpty error %1").arg(error));
+    }
+
+    if (pid == 0) {
+        close(execStatus[0]);
+        applyPtyEnvironment();
+        std::vector<QByteArray> encodedArguments;
+        encodedArguments.reserve(static_cast<size_t>(arguments.size()) + 1);
+        encodedArguments.push_back(program.toLocal8Bit());
+        for (const QString &argument : arguments)
+            encodedArguments.push_back(argument.toLocal8Bit());
+        std::vector<char *> argv;
+        argv.reserve(encodedArguments.size() + 1);
+        for (QByteArray &argument : encodedArguments)
+            argv.push_back(argument.data());
+        argv.push_back(nullptr);
+        execvp(argv.front(), argv.data());
+        const int error = errno;
+        (void)::write(execStatus[1], &error, sizeof(error));
+        _exit(127);
+    }
+    close(execStatus[1]);
+    int execError = 0;
+    ssize_t statusBytes;
+    do {
+        statusBytes = ::read(execStatus[0], &execError, sizeof(execError));
+    } while (statusBytes < 0 && errno == EINTR);
+    close(execStatus[0]);
+    if (statusBytes > 0 || statusBytes < 0) {
+        close(master);
+        waitpid(pid, nullptr, 0);
+        const int error = statusBytes > 0 ? execError : errno;
+        return startFallback(program, arguments, QStringLiteral("could not execute %1 (error %2)").arg(program).arg(error));
+    }
+    impl_->master = master;
+    impl_->child = pid;
+#endif
+
+    impl_->fallbackMode = false;
+    impl_->stopReader.store(false);
+    impl_->running.store(true);
+    QPointer<TerminalBackend> guard(this);
+    Impl *state = impl_.get();
+    state->reader = std::thread([guard, state] {
+        char buffer[4096];
+#ifdef Q_OS_WIN
+        while (!state->stopReader.load()) {
+            DWORD count = 0;
+            if (!ReadFile(state->outputRead, buffer, sizeof(buffer) - 1, &count, nullptr) || count == 0)
+                break;
+            const QByteArray bytes(buffer, static_cast<qsizetype>(count));
+#else
+        while (!state->stopReader.load()) {
+            const ssize_t count = ::read(state->master, buffer, sizeof(buffer) - 1);
+            if (count <= 0)
+                break;
+            const QByteArray bytes(buffer, static_cast<qsizetype>(count));
+#endif
+            if (guard) {
+                QMetaObject::invokeMethod(
+                    guard.data(),
+                    [guard, bytes] {
+                        if (!guard)
+                            return;
+                        emit guard->outputReady(bytes);
+                        emit guard->outputText(QString::fromUtf8(bytes));
+                    },
+                    Qt::QueuedConnection);
+            }
+        }
+        state->running.store(false);
+        if (guard) {
+            QMetaObject::invokeMethod(
+                guard.data(),
+                [guard, state] {
+                    if (!guard)
+                        return;
+#ifdef Q_OS_WIN
+                    DWORD exitCode = 0;
+                    if (state->processHandle)
+                        GetExitCodeProcess(state->processHandle, &exitCode);
+                    emit guard->processFinished(static_cast<int>(exitCode));
+#else
+                    int status = 0;
+                    if (state->child > 0)
+                        waitpid(state->child, &status, WNOHANG);
+                    emit guard->processFinished(WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+#endif
+                },
+                Qt::QueuedConnection);
+        }
+    });
+    return true;
+}
+
+bool TerminalBackend::startFallback(const QString &program, const QStringList &arguments, const QString &reason)
+{
+    if (impl_->fallback) {
+        impl_->fallback->kill();
+        impl_->fallback->waitForFinished(500);
+        impl_->fallback->deleteLater();
+    }
+    emit errorOccurred(QStringLiteral("PTY fallback: %1").arg(reason));
+
+    impl_->fallback = new QProcess(this);
+    impl_->process_ = impl_->fallback;
+    impl_->fallbackMode = true;
+    impl_->fallback->setProcessChannelMode(QProcess::MergedChannels);
+
     QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
     env.insert(QStringLiteral("TERM"), QStringLiteral("xterm-256color"));
-    env.insert(QStringLiteral("COLUMNS"), QString::number(qMax(40, terminalSize.width())));
-    env.insert(QStringLiteral("LINES"), QString::number(qMax(15, terminalSize.height())));
-    process_->setProcessEnvironment(env);
-    process_->setProcessChannelMode(QProcess::MergedChannels);
-    connect(process_, &QProcess::readyReadStandardOutput, this, [this, scr] {
-        const QByteArray raw = process_->readAllStandardOutput();
-        emit outputReady(raw);
-        emit outputText(scr->feed(QString::fromUtf8(raw)));
+    env.insert(QStringLiteral("COLORTERM"), QStringLiteral("truecolor"));
+    impl_->fallback->setProcessEnvironment(env);
+    impl_->fallback->setProgram(program);
+    impl_->fallback->setArguments(arguments);
+
+    connect(impl_->fallback, &QProcess::readyReadStandardOutput, this, [this] {
+        const QByteArray bytes = impl_->fallback->readAllStandardOutput();
+        emit outputReady(bytes);
+        emit outputText(QString::fromUtf8(bytes));
     });
-    connect(process_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this](int code, QProcess::ExitStatus) {
-        if (auto *s = g_linuxScreens.take(this)) delete s;
-        emit processFinished(code);
+    connect(impl_->fallback, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
+        emit errorOccurred(impl_->fallback->errorString());
     });
-    const QString userShell = qEnvironmentVariable("SHELL", QStringLiteral("/bin/bash"));
-    const QString cmd = QStringLiteral("stty cols %1 rows %2 2>/dev/null; exec %3 -l")
-                            .arg(qMax(40, terminalSize.width()))
-                            .arg(qMax(15, terminalSize.height()))
-                            .arg(userShell);
-    process_->start(QStringLiteral("/usr/bin/script"), {QStringLiteral("-qfc"), cmd, QStringLiteral("/dev/null")});
-    return process_->waitForStarted(2000);
-#endif
-    return false;
+    connect(
+        impl_->fallback,
+        qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+        this,
+        [this](int code, QProcess::ExitStatus) {
+            impl_->running.store(false);
+            emit processFinished(code);
+        });
+
+    impl_->fallback->start();
+    const bool started = impl_->fallback->waitForStarted(2500);
+    impl_->running.store(started);
+    return started;
 }
 
-void TerminalBackend::writeInput(const QByteArray &data) {
-#ifdef Q_OS_WIN
-    if (auto *st = g_states.value(this, nullptr); st && st->running.load() && st->hPipeInWrite != INVALID_HANDLE_VALUE) {
-        DWORD written = 0; WriteFile(st->hPipeInWrite, data.constData(), static_cast<DWORD>(data.size()), &written, nullptr); FlushFileBuffers(st->hPipeInWrite); return;
+void TerminalBackend::writeInput(const QByteArray &data)
+{
+    if (impl_->fallbackMode) {
+        if (impl_->fallback) {
+            impl_->fallback->write(data);
+            impl_->fallback->waitForBytesWritten(50);
+        }
+        return;
     }
+#ifdef Q_OS_WIN
+    if (impl_->inputWrite == INVALID_HANDLE_VALUE || impl_->inputWrite == nullptr) {
+        emit errorOccurred(QStringLiteral("WriteFile error: invalid input handle"));
+        return;
+    }
+    DWORD written = 0;
+    if (!WriteFile(impl_->inputWrite, data.constData(), static_cast<DWORD>(data.size()), &written, nullptr))
+        emit errorOccurred(QStringLiteral("WriteFile error: %1").arg(GetLastError()));
 #else
-    if (process_ && process_->state() == QProcess::Running) process_->write(data);
+    if (impl_->master < 0) {
+        emit errorOccurred(QStringLiteral("PTY input descriptor invalid"));
+        return;
+    }
+    if (::write(impl_->master, data.constData(), static_cast<size_t>(data.size())) < 0)
+        emit errorOccurred(QStringLiteral("PTY write error: %1").arg(errno));
 #endif
 }
-void TerminalBackend::sendCommand(const QString &command) { writeInput((command + QStringLiteral("\n")).toUtf8()); }
-void TerminalBackend::resizeTerminal(const QSize &s) {
-#ifdef Q_OS_WIN
-    if (auto *st = g_states.value(this, nullptr); st && st->hPC && conPtyApi().resize) { st->screen.resize(s.width(), s.height()); conPtyApi().resize(st->hPC, {static_cast<SHORT>(qMax(110, s.width())), static_cast<SHORT>(qMax(15, s.height()))}); }
-#else
-    Q_UNUSED(s);
-#endif
+
+void TerminalBackend::sendCommand(const QString &command)
+{
+    writeInput(command.toUtf8() + lineEnding());
 }
-void TerminalBackend::stop() {
+
+void TerminalBackend::resizeTerminal(const QSize &size)
+{
 #ifdef Q_OS_WIN
-    if (auto *st = g_states.take(this)) {
-        st->running.store(false); if (st->hPC && conPtyApi().close) conPtyApi().close(st->hPC);
-        if (st->hPipeInWrite != INVALID_HANDLE_VALUE) CloseHandle(st->hPipeInWrite); if (st->hPipeOutRead != INVALID_HANDLE_VALUE) CloseHandle(st->hPipeOutRead);
-        if (st->hProcess != INVALID_HANDLE_VALUE) { TerminateProcess(st->hProcess, 0); CloseHandle(st->hProcess); } delete st;
+    if (impl_->hpc && impl_->resize) {
+        COORD ws{
+            static_cast<SHORT>(qBound(2, size.width(), 300)),
+            static_cast<SHORT>(qBound(2, size.height(), 120))};
+        impl_->resize(impl_->hpc, ws);
     }
 #else
-    if (process_) { process_->kill(); process_->waitForFinished(500); process_->deleteLater(); process_ = nullptr; }
+    if (impl_->master >= 0) {
+        winsize ws{};
+        ws.ws_col = static_cast<unsigned short>(qBound(2, size.width(), 300));
+        ws.ws_row = static_cast<unsigned short>(qBound(2, size.height(), 120));
+        ioctl(impl_->master, TIOCSWINSZ, &ws);
+    }
 #endif
+}
+
+void TerminalBackend::stop()
+{
+    impl_->stopReader.store(true);
+#ifdef Q_OS_WIN
+    if (impl_->inputWrite != INVALID_HANDLE_VALUE)
+        CloseHandle(impl_->inputWrite);
+    impl_->inputWrite = INVALID_HANDLE_VALUE;
+    if (impl_->hpc && impl_->close)
+        impl_->close(impl_->hpc);
+    impl_->hpc = nullptr;
+    if (impl_->reader.joinable())
+        impl_->reader.join();
+    if (impl_->outputRead != INVALID_HANDLE_VALUE)
+        CloseHandle(impl_->outputRead);
+    impl_->outputRead = INVALID_HANDLE_VALUE;
+    if (impl_->processHandle) {
+        TerminateProcess(impl_->processHandle, 0);
+        CloseHandle(impl_->processHandle);
+        impl_->processHandle = nullptr;
+    }
+#else
+    if (impl_->master >= 0)
+        close(impl_->master);
+    impl_->master = -1;
+    if (impl_->child > 0)
+        kill(impl_->child, SIGHUP);
+    if (impl_->reader.joinable())
+        impl_->reader.join();
+    if (impl_->child > 0)
+        waitpid(impl_->child, nullptr, WNOHANG);
+    impl_->child = -1;
+#endif
+    if (impl_->fallback) {
+        impl_->fallback->kill();
+        impl_->fallback->waitForFinished(500);
+        impl_->fallback->deleteLater();
+        impl_->fallback = nullptr;
+    }
+    impl_->process_ = nullptr;
+    impl_->fallbackMode = false;
+    impl_->running.store(false);
 }
