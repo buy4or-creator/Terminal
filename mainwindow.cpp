@@ -1,9 +1,24 @@
-﻿#include <QShortcut>
+#include <QButtonGroup>
+#include <QMovie>
+#include <QMimeData>
+#include <QDragEnterEvent>
+#include <QDropEvent>
+#include <QImageReader>
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <mferror.h>
+#include <mmsystem.h>
+#endif
+#include <QShortcut>
 #include <QDesktopServices>
 #include <QUrl>
 #include <QHash>
 static QHash<QString, QString> s_sftpSessionPasswords;
 #include "mainwindow.h"
+
 static QStringList s_sftpBackHistory;
 static QStringList s_sftpForwardHistory;
 static QStringList s_sftpCutRemotePaths;
@@ -96,6 +111,18 @@ static QStringList s_sftpCutRemotePaths;
 #include <functional>
 #include <memory>
 
+static int s_activeNoteBoard = 0;
+static QString s_noteSelBorderColor = QStringLiteral("#ffffff");
+static QString s_noteSelTextColor = QStringLiteral("#ffffff");
+static int s_selectedAudioDeviceId = -1;
+static QStringList s_noteBoardNames = {QStringLiteral("Основное поле")};
+static QString activeNotesFilePath() {
+    const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(dir);
+    return (s_activeNoteBoard == 0)
+        ? (dir + QStringLiteral("/notes.json"))
+        : QStringLiteral("%1/notes_board_%2.json").arg(dir).arg(s_activeNoteBoard);
+}
 namespace {
 constexpr auto kSettingsOrg = "ConsoleV1";
 constexpr auto kSettingsApp = "TerminalApp";
@@ -327,6 +354,7 @@ private:
     bool meteorActive_ = false;
 };
 
+
 namespace {
 QPushButton *button(const QString &text, QWidget *parent, const QString &objectName = QString())
 {
@@ -528,15 +556,17 @@ protected:
             const qreal fit=qMin((terminal.width()-16)/sample.width(),(terminal.height()-14)/sample.height());
             sample*=qMin(1.0,fit);
             sample*=qBound(0.55,notesZoom_/18.0,1.5);
+            const QColor selB(s_noteSelBorderColor);
+            const QColor selT(s_noteSelTextColor);
             QRectF note(QPointF(terminal.center().x()-sample.width()/2,terminal.center().y()-sample.height()/2),sample);
-            p.setPen(QPen(QColor(255,255,255,95),1));
-            p.setBrush(QColor(37,44,59,225));
-            p.drawRoundedRect(note,5,5);
-            p.setPen(QPen(accent,1.2));
-            p.drawLine(note.left()+5,note.top()+11,note.right()-5,note.top()+11);
-            p.setPen(QColor(240,244,250,210));
-            QFont sampleFont=font(); sampleFont.setPixelSize(8); p.setFont(sampleFont);
-            p.drawText(note.adjusted(5,2,-5,-2),Qt::AlignLeft|Qt::AlignTop,QStringLiteral("Заметка"));
+            p.setPen(QPen(selB, 1.8));
+            p.setBrush(QColor(selB.red(), selB.green(), selB.blue(), 42));
+            p.drawRoundedRect(note, 6, 6);
+            p.setPen(QPen(selB, 1.2));
+            p.drawLine(note.left()+5, note.top()+11, note.right()-5, note.top()+11);
+            p.setPen(selT);
+            QFont sampleFont=font(); sampleFont.setPixelSize(8); sampleFont.setWeight(QFont::DemiBold); p.setFont(sampleFont);
+            p.drawText(note.adjusted(5, 2, -5, -2), Qt::AlignLeft|Qt::AlignTop, QStringLiteral("Выделено"));
             p.setPen(QColor(225,232,242,120));
             p.drawText(QRectF(terminal.left()+5,terminal.bottom()-15,terminal.width()-10,12),Qt::AlignRight|Qt::AlignVCenter,QStringLiteral("%1% · %2").arg(notesZoom_).arg(notePreset_==0?QStringLiteral("Компактный"):notePreset_==1?QStringLiteral("Стандартный"):QStringLiteral("Крупный")));
             return;
@@ -757,7 +787,22 @@ public:
         painter->setBrush(theme_ == QStringLiteral("Graphite") ? QColor("#26292e") : (theme_ == QStringLiteral("Obsidian") ? QColor("#101116") : QColor("#111426")));
         painter->setPen(QPen(QColor("#ffffff"), 1));
         painter->drawRoundedRect(boundingRect(), 14, 14);
-        painter->setPen(QPen(QColor(accent_), 2));
+        const bool sel = isSelected();
+        const QColor selBorder(s_noteSelBorderColor);
+        const QColor selText(s_noteSelTextColor);
+        if (editor_) {
+            const QString tc = sel ? s_noteSelTextColor : QStringLiteral("rgba(245,247,250,0.90)");
+            if (editor_->property("lastTextColor").toString() != tc) {
+                editor_->setProperty("lastTextColor", tc);
+                editor_->setStyleSheet(QStringLiteral("QTextEdit{background:transparent;border:0;padding:0;color:%1;selection-background-color:rgba(126,184,218,0.35);}").arg(tc));
+            }
+        }
+        if (sel) {
+            painter->setPen(QPen(selBorder, 2.6));
+            painter->setBrush(QColor(selBorder.red(), selBorder.green(), selBorder.blue(), 38));
+            painter->drawRoundedRect(boundingRect().adjusted(1, 1, -1, -1), 14, 14);
+        }
+        painter->setPen(QPen(sel ? selBorder : QColor(accent_), sel ? 2.6 : 2.0));
         painter->drawLine(QPointF(13, 42), QPointF(width_-13, 42));
         if(!headingProxy_->isVisible()){
             painter->setPen(QColor("#f3f3f6"));
@@ -765,277 +810,622 @@ public:
         }
         painter->setPen(QColor("#ff929b"));
         painter->drawText(QRectF(width_-29, 8, 20, 24), Qt::AlignCenter, QStringLiteral("×"));
+                if (!mediaPath_.isEmpty()) {
+            const QRectF mediaRect(14, 50, qMax(40.0, width_ - 28.0), qMax(40.0, height_ - 66.0));
+            painter->save();
+            QPainterPath clip; clip.addRoundedRect(mediaRect, 8, 8); painter->setClipPath(clip);
+            if (isGif_ && movie_ && movie_->isValid()) {
+                const QPixmap frame = movie_->currentPixmap();
+                if (!frame.isNull())
+                    painter->drawPixmap(mediaRect.toRect(), frame.scaled(mediaRect.size().toSize(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
+            } else if (isAudio_) {
+                painter->fillRect(mediaRect, QColor(18, 22, 32, 195));
+                const QRectF playBtn(mediaRect.left() + 8, mediaRect.center().y() - 18, 36, 36);
+                painter->setBrush(QColor(accent_.isEmpty() ? QStringLiteral("#7eb8da") : accent_));
+                painter->setPen(Qt::NoPen);
+                painter->drawEllipse(playBtn);
+                painter->setBrush(QColor("#0f131a"));
+                if (videoPlaying_) {
+                    painter->drawRoundedRect(QRectF(playBtn.center().x() - 5, playBtn.center().y() - 6, 3.5, 12), 1, 1);
+                    painter->drawRoundedRect(QRectF(playBtn.center().x() + 1.5, playBtn.center().y() - 6, 3.5, 12), 1, 1);
+                } else {
+                    QPolygonF tri; tri << QPointF(playBtn.center().x() - 4, playBtn.center().y() - 7) << QPointF(playBtn.center().x() + 8, playBtn.center().y()) << QPointF(playBtn.center().x() - 4, playBtn.center().y() + 7);
+                    painter->drawPolygon(tri);
+                }
+                const qreal waveLeft = playBtn.right() + 12;
+                const qreal waveRight = mediaRect.right() - 10;
+                const qreal waveW = qMax(40.0, waveRight - waveLeft);
+                const qreal waveTop = mediaRect.top() + 8;
+                const qreal waveH = qMax(18.0, mediaRect.height() - 34.0);
+                const qreal progress = (audioDuration100Ns_ > 0) ? qBound(0.0, qreal(audioPos100Ns_) / qreal(audioDuration100Ns_), 1.0) : 0.0;
+                const int bars = qMax(16, int(waveW / 5.0));
+                for (int b = 0; b < bars; ++b) {
+                    const qreal t = qreal(b) / qMax(1, bars - 1);
+                    const qreal hFactor = 0.25 + 0.75 * qAbs(std::sin(b * 1.35 + 0.7) * std::cos(b * 0.45));
+                    const qreal bh = qMax(4.0, waveH * hFactor);
+                    const qreal bx = waveLeft + t * (waveW - 3.0);
+                    const qreal by = waveTop + (waveH - bh) / 2.0;
+                    painter->setBrush((t <= progress) ? QColor(accent_.isEmpty() ? QStringLiteral("#7eb8da") : accent_) : QColor(255, 255, 255, 60));
+                    painter->drawRoundedRect(QRectF(bx, by, 3.0, bh), 1.5, 1.5);
+                }
+                const int curSec = int(audioPos100Ns_ / 10000000LL);
+                const int totSec = int(audioDuration100Ns_ / 10000000LL);
+                const QString timeStr = QStringLiteral("%1:%2 / %3:%4")
+                    .arg(curSec / 60, 2, 10, QLatin1Char('0')).arg(curSec % 60, 2, 10, QLatin1Char('0'))
+                    .arg(totSec / 60, 2, 10, QLatin1Char('0')).arg(totSec % 60, 2, 10, QLatin1Char('0'));
+                painter->setPen(QColor(235, 240, 248, 195));
+                painter->drawText(QRectF(waveLeft, mediaRect.bottom() - 21, 95, 18), Qt::AlignLeft | Qt::AlignVCenter, timeStr);
+
+                const qreal volLeft = qMax(waveLeft + 96, waveRight - 86);
+                painter->drawText(QRectF(volLeft, mediaRect.bottom() - 22, 22, 20), Qt::AlignCenter, videoMuted_ ? QStringLiteral("🔇") : QStringLiteral("🔊"));
+                const QRectF vTrack(volLeft + 24, mediaRect.bottom() - 13, qMax(28.0, waveRight - (volLeft + 26)), 4);
+                painter->setBrush(QColor(255, 255, 255, 45));
+                painter->drawRoundedRect(vTrack, 2, 2);
+                const qreal vFill = videoMuted_ ? 0.0 : qBound(0.0, qreal(videoVolume_), 1.0);
+                painter->setBrush(QColor(accent_.isEmpty() ? QStringLiteral("#7eb8da") : accent_));
+                painter->drawRoundedRect(QRectF(vTrack.left(), vTrack.top(), vTrack.width() * vFill, 4), 2, 2);
+            } else if (isVideo_) {
+                if (!videoFrame_.isNull()) {
+                    painter->drawPixmap(mediaRect.toRect(), videoFrame_.scaled(mediaRect.size().toSize(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
+                } else {
+                    painter->fillRect(mediaRect, QColor(14, 18, 28, 210));
+                }
+                if (!videoPlaying_) {
+                    const QPointF c = mediaRect.center();
+                    painter->setBrush(QColor(18, 24, 36, 195)); painter->setPen(QPen(QColor(126, 184, 218, 220), 1.5)); painter->drawEllipse(c, 22, 22);
+                    QPolygonF tri; tri << QPointF(c.x() - 5, c.y() - 9) << QPointF(c.x() + 10, c.y()) << QPointF(c.x() - 5, c.y() + 9);
+                    painter->setBrush(QColor("#f3f5f8")); painter->setPen(Qt::NoPen); painter->drawPolygon(tri);
+                }
+                const QRectF barRect(mediaRect.left() + 8, mediaRect.bottom() - 32, qMin(150.0, mediaRect.width() - 16), 24);
+                painter->setBrush(QColor(12, 16, 24, 195));
+                painter->setPen(QPen(QColor(255, 255, 255, 45), 1));
+                painter->drawRoundedRect(barRect, 7, 7);
+                painter->setPen(QColor("#f3f5f8"));
+                painter->drawText(QRectF(barRect.left() + 2, barRect.top(), 24, 24), Qt::AlignCenter, videoMuted_ ? QStringLiteral("🔇") : QStringLiteral("🔊"));
+                const QRectF sliderTrack(barRect.left() + 28, barRect.center().y() - 2, barRect.width() - 38, 4);
+                painter->setBrush(QColor(255, 255, 255, 45)); painter->setPen(Qt::NoPen);
+                painter->drawRoundedRect(sliderTrack, 2, 2);
+                const qreal fillRatio = videoMuted_ ? 0.0 : qBound(0.0, qreal(videoVolume_), 1.0);
+                painter->setBrush(QColor(accent_.isEmpty() ? QStringLiteral("#7eb8da") : accent_));
+                painter->drawRoundedRect(QRectF(sliderTrack.left(), sliderTrack.top(), sliderTrack.width() * fillRatio, 4), 2, 2);
+                painter->setBrush(QColor("#ffffff"));
+                painter->drawEllipse(QPointF(sliderTrack.left() + sliderTrack.width() * fillRatio, sliderTrack.center().y()), 5, 5);
+            } else if (!pixmap_.isNull()) {
+                painter->drawPixmap(mediaRect.toRect(), pixmap_.scaled(mediaRect.size().toSize(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
+            }
+            painter->restore();
+        }
         painter->setPen(QPen(QColor(220,230,245,150),1,Qt::DashLine));
         painter->drawLine(QPointF(width_-20,height_-8),QPointF(width_-8,height_-20));
         painter->drawLine(QPointF(width_-14,height_-8),QPointF(width_-8,height_-14));
     }
+    QString id() const { return id_; }
     QString heading() const { return heading_; }
     QString content() const { return content_; }
-    QString id() const { return id_; }
     qreal cardWidth() const { return width_; }
     qreal cardHeight() const { return height_; }
-    QLineEdit *headingEditor() const { return headingEditor_; }
-    QTextEdit *contentEditor() const { return editor_; }
-    void setStoredSize(qreal width,qreal height){manualWidth_=qMax(baseWidth_,width);manualHeight_=qMax(baseHeight_,height);resizeToContent();}
-    void setBasePreset(int preset) {
-        static const QSizeF sizes[] = {QSizeF(200,120), QSizeF(260,160), QSizeF(340,210)};
-        const QSizeF size = sizes[qBound(0,preset,2)];
-        if(qAbs(manualWidth_-baseWidth_)<0.5)manualWidth_=size.width();
-        if(qAbs(manualHeight_-baseHeight_)<0.5)manualHeight_=size.height();
-        baseWidth_ = size.width(); baseHeight_ = size.height();
-        manualWidth_ = qMax(manualWidth_, baseWidth_); manualHeight_ = qMax(manualHeight_, baseHeight_);
-        resizeToContent();
-    }
-    void setAccent(const QString &accent) { accent_ = accent; update(); }
-    void setTheme(const QString &theme) { theme_ = theme; update(); }
-    void setHeading(const QString &heading) { heading_ = heading; headingEditor_->setText(heading); update(); }
-    void setContent(const QString &content) { content_ = content; editor_->setPlainText(content); resizeToContent(); update(); }
-    void focusEditor(){editor_->setFocus(Qt::OtherFocusReason);}
-    void editHeading(){headingEditor_->setText(heading_);headingProxy_->show();headingEditor_->setFocus(Qt::MouseFocusReason);headingEditor_->selectAll();}
-    void setSelectionMode(bool active) { selectionMode_ = active; }
+    void focusEditor() { if (editor_) editor_->setFocus(Qt::MouseFocusReason); }
+    void editHeading() { if (headingEditor_ && headingProxy_) { headingEditor_->setText(heading_); headingProxy_->show(); headingEditor_->setFocus(Qt::MouseFocusReason); headingEditor_->selectAll(); } }
+    void setSelectionMode(bool active) { selectionMode_ = active; setFlag(QGraphicsItem::ItemIsMovable, !active); }
+    void setStoredSize(qreal w, qreal h) { manualWidth_ = qMax(180.0, w); manualHeight_ = qMax(isAudio_ ? 116.0 : 140.0, h); resizeToContent(); }
+    void setBaseSize(qreal w, qreal h) { baseWidth_ = w; baseHeight_ = h; if (manualWidth_ < w) manualWidth_ = w; if (manualHeight_ < h) manualHeight_ = h; resizeToContent(); }
     std::function<void()> moved;
     std::function<void()> geometryChanged;
     std::function<void()> contentChanged;
     std::function<void(NoteCard *)> linkRequested;
     std::function<void(NoteCard *)> deleteRequested;
-protected:
-    void mousePressEvent(QGraphicsSceneMouseEvent *event) override
-    {
-        if (selectionMode_ && event->button() == Qt::LeftButton) {
-            QGraphicsObject::mousePressEvent(event);
-            return;
+    QLineEdit *headingEditor() const { return headingEditor_; }
+    QTextEdit *contentEditor() const { return editor_; }
+    void setAccent(const QString &a) { accent_ = a; update(); }
+    void setTheme(const QString &t) { theme_ = t; update(); }
+    void setBasePreset(int preset) {
+        if (preset == 0) setBaseSize(200, 120);
+        else if (preset == 2) setBaseSize(340, 220);
+        else setBaseSize(260, 160);
+    }
+    void setMediaFile(const QString &storedPath) {
+        mediaPath_ = storedPath;
+        if (mediaPath_.isEmpty()) return;
+        const QString ext = QFileInfo(mediaPath_).suffix().toLower();
+        isGif_ = (ext == QStringLiteral("gif"));
+        isAudio_ = QStringList{QStringLiteral("mp3"),QStringLiteral("wav"),QStringLiteral("ogg"),QStringLiteral("flac"),QStringLiteral("m4a"),QStringLiteral("aac"),QStringLiteral("opus"),QStringLiteral("wma")}.contains(ext); isVideo_ = !isAudio_ && QStringList{QStringLiteral("mp4"),QStringLiteral("webm"),QStringLiteral("mkv"),QStringLiteral("avi"),QStringLiteral("mov"),QStringLiteral("m4v"),QStringLiteral("wmv")}.contains(ext);
+        isAudio_ = QStringList{QStringLiteral("mp3"), QStringLiteral("wav"), QStringLiteral("ogg"), QStringLiteral("flac"), QStringLiteral("m4a"), QStringLiteral("aac"), QStringLiteral("opus"), QStringLiteral("wma")}.contains(ext); if (isAudio_) isVideo_ = false;
+        if (editor_) editor_->hide();
+        if (proxy_) proxy_->hide();
+        if (movie_) { movie_->stop(); delete movie_; movie_ = nullptr; }
+        if (videoTimer_) { videoTimer_->stop(); delete videoTimer_; videoTimer_ = nullptr; } if (!audioAlias_.isEmpty()) { mciSendStringW(reinterpret_cast<LPCWSTR>(QStringLiteral("close %1").arg(audioAlias_).utf16()), nullptr, 0, nullptr); audioAlias_.clear(); }
+#ifdef Q_OS_WIN
+        if (mfReader_) { mfReader_->Release(); mfReader_ = nullptr; }
+#endif
+        if (isGif_) {
+            movie_ = new QMovie(mediaPath_, QByteArray(), this);
+            movie_->setCacheMode(QMovie::CacheAll);
+            connect(movie_, &QMovie::frameChanged, this, [this] { update(); });
+            connect(movie_, &QMovie::finished, this, [this] { if (movie_) movie_->start(); });
+            movie_->start();
+        } else if (isVideo_ || isAudio_) {
+#ifdef Q_OS_WIN
+            CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); MFStartup(MF_VERSION);
+            const std::wstring wpath = QDir::toNativeSeparators(mediaPath_).toStdWString();
+            videoPlaying_ = true; videoMuted_ = false;
+            if (isVideo_) {
+            IMFAttributes *attrs = nullptr;
+            MFCreateAttributes(&attrs, 1);
+            if (attrs) {
+                attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+                IMFSourceReader *reader = nullptr;
+                if (SUCCEEDED(MFCreateSourceReaderFromURL(wpath.c_str(), attrs, &reader)) && reader) {
+                    IMFMediaType *type = nullptr;
+                    MFCreateMediaType(&type);
+                    type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+                    type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+                    reader->SetCurrentMediaType(DWORD(MF_SOURCE_READER_FIRST_VIDEO_STREAM), nullptr, type);
+                    type->Release();
+                    IMFMediaType *curType = nullptr;
+                    if (SUCCEEDED(reader->GetCurrentMediaType(DWORD(MF_SOURCE_READER_FIRST_VIDEO_STREAM), &curType)) && curType) {
+                        UINT32 w = 0, h = 0;
+                        MFGetAttributeSize(curType, MF_MT_FRAME_SIZE, &w, &h);
+                        videoW_ = int(w); videoH_ = int(h);
+                        curType->Release();
+                    }
+                    mfReader_ = reader;
+                    videoPlaying_ = true; videoMuted_ = false; audioAlias_ = QStringLiteral("vid_%1").arg(quintptr(this)); mciSendStringW(reinterpret_cast<LPCWSTR>(QStringLiteral("open \"%1\" type mpegvideo alias %2").arg(QDir::toNativeSeparators(mediaPath_), audioAlias_).utf16()), nullptr, 0, nullptr); mciSendStringW(reinterpret_cast<LPCWSTR>(QStringLiteral("play %1 repeat").arg(audioAlias_).utf16()), nullptr, 0, nullptr);
+                    videoTimer_ = new QTimer(this);
+                    connect(videoTimer_, &QTimer::timeout, this, [this] { decodeNextVideoFrame(); });
+                    videoTimer_->start(33);
+                    decodeNextVideoFrame();
+                }
+                attrs->Release();
+            }
+            }
+            if (audioTimer_) { audioTimer_->stop(); delete audioTimer_; audioTimer_ = nullptr; }
+            if (mfAudioReader_) { mfAudioReader_->Release(); mfAudioReader_ = nullptr; }
+            if (waveOut_) { waveOutReset(waveOut_); waveOutClose(waveOut_); waveOut_ = nullptr; }
+            IMFSourceReader *aReader = nullptr;
+            if (SUCCEEDED(MFCreateSourceReaderFromURL(wpath.c_str(), nullptr, &aReader)) && aReader) {
+                aReader->SetStreamSelection(DWORD(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+                aReader->SetStreamSelection(DWORD(MF_SOURCE_READER_FIRST_AUDIO_STREAM), TRUE);
+                IMFMediaType *aType = nullptr;
+                MFCreateMediaType(&aType);
+                aType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+                aType->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+                if (SUCCEEDED(aReader->SetCurrentMediaType(DWORD(MF_SOURCE_READER_FIRST_AUDIO_STREAM), nullptr, aType))) {
+                    IMFMediaType *actualType = nullptr;
+                    if (SUCCEEDED(aReader->GetCurrentMediaType(DWORD(MF_SOURCE_READER_FIRST_AUDIO_STREAM), &actualType)) && actualType) {
+                        WAVEFORMATEX *pWfx = nullptr; UINT32 cbSize = 0;
+                        if (SUCCEEDED(MFCreateWaveFormatExFromMFMediaType(actualType, &pWfx, &cbSize)) && pWfx) {
+                            const UINT devId = (s_selectedAudioDeviceId < 0) ? WAVE_MAPPER : UINT(s_selectedAudioDeviceId);
+                            if (waveOutOpen(&waveOut_, devId, pWfx, 0, 0, CALLBACK_NULL) == MMSYSERR_NOERROR) {
+                                waveOutSetVolume(waveOut_, 0xFFFFFFFF);
+                                PROPVARIANT durVar; PropVariantInit(&durVar);
+                                if (SUCCEEDED(aReader->GetPresentationAttribute(DWORD(MF_SOURCE_READER_MEDIASOURCE), MF_PD_DURATION, &durVar))) {
+                                    audioDuration100Ns_ = durVar.uhVal.QuadPart;
+                                    PropVariantClear(&durVar);
+                                }
+                                audioPos100Ns_ = 0;
+                                mfAudioReader_ = aReader;
+                                audioTimer_ = new QTimer(this);
+                                connect(audioTimer_, &QTimer::timeout, this, [this] { pumpAudioSamples(); });
+                                if (isAudio_) { videoPlaying_ = false; audioTimer_->stop(); } else { audioTimer_->start(20); }
+                            } else { aReader->Release(); }
+                            CoTaskMemFree(pWfx);
+                        } else { aReader->Release(); }
+                        actualType->Release();
+                    } else { aReader->Release(); }
+                } else { aReader->Release(); }
+                aType->Release();
+            }
+            if (isAudio_ && !mfAudioReader_) {
+                audioAlias_ = QStringLiteral("gs_%1").arg(quintptr(this));
+                const QString nativeFile = QDir::toNativeSeparators(mediaPath_);
+                mciSendStringW(reinterpret_cast<LPCWSTR>(QStringLiteral("open \"%1\" alias %2").arg(nativeFile, audioAlias_).utf16()), nullptr, 0, nullptr);
+                mciSendStringW(reinterpret_cast<LPCWSTR>(QStringLiteral("set %1 time format milliseconds").arg(audioAlias_).utf16()), nullptr, 0, nullptr);
+                wchar_t lenBuf[64]{};
+                if (mciSendStringW(reinterpret_cast<LPCWSTR>(QStringLiteral("status %1 length").arg(audioAlias_).utf16()), lenBuf, 64, nullptr) == 0) {
+                    audioDuration100Ns_ = QString::fromWCharArray(lenBuf).toLongLong() * 10000LL;
+                }
+                audioTimer_ = new QTimer(this);
+                connect(audioTimer_, &QTimer::timeout, this, [this] {
+                    if (!videoPlaying_ || audioAlias_.isEmpty()) return;
+                    wchar_t posBuf[64]{};
+                    if (mciSendStringW(reinterpret_cast<LPCWSTR>(QStringLiteral("status %1 position").arg(audioAlias_).utf16()), posBuf, 64, nullptr) == 0) {
+                        audioPos100Ns_ = QString::fromWCharArray(posBuf).toLongLong() * 10000LL;
+                        if (audioDuration100Ns_ > 0 && audioPos100Ns_ >= audioDuration100Ns_) {
+                            audioPos100Ns_ = 0; videoPlaying_ = false; audioTimer_->stop();
+                            mciSendStringW(reinterpret_cast<LPCWSTR>(QStringLiteral("seek %1 to start").arg(audioAlias_).utf16()), nullptr, 0, nullptr);
+                        }
+                        update();
+                    }
+                });
+            }
+#endif
+        } else {
+            QImageReader reader(mediaPath_);
+            reader.setAutoTransform(true);
+            const QImage img = reader.read();
+            if (!img.isNull()) pixmap_ = QPixmap::fromImage(img);
+            else pixmap_.load(mediaPath_);
         }
+        resizeToContent();
+        update();
+    }
+    void decodeNextVideoFrame() {
+#ifdef Q_OS_WIN
+        if (!mfReader_ || !videoPlaying_) return;
+        DWORD streamIdx = 0, flags = 0; LONGLONG ts = 0; IMFSample *sample = nullptr;
+        HRESULT hr = mfReader_->ReadSample(DWORD(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, &streamIdx, &flags, &ts, &sample);
+        if (FAILED(hr) || (flags & MF_SOURCE_READERF_ENDOFSTREAM)) {
+            if (sample) sample->Release();
+            PROPVARIANT var; PropVariantInit(&var); var.vt = VT_I8; var.hVal.QuadPart = 0;
+            mfReader_->SetCurrentPosition(GUID_NULL, var); PropVariantClear(&var); return;
+        }
+        if (sample) {
+            IMFMediaBuffer *buf = nullptr;
+            if (SUCCEEDED(sample->ConvertToContiguousBuffer(&buf)) && buf) {
+                BYTE *data = nullptr; DWORD maxLen = 0, curLen = 0;
+                if (SUCCEEDED(buf->Lock(&data, &maxLen, &curLen)) && data && curLen > 0) {
+                    UINT32 strideVal = 0; IMFMediaType *mt = nullptr;
+                    if (SUCCEEDED(mfReader_->GetCurrentMediaType(DWORD(MF_SOURCE_READER_FIRST_VIDEO_STREAM), &mt)) && mt) {
+                        UINT32 w = 0, h = 0;
+                        if (SUCCEEDED(MFGetAttributeSize(mt, MF_MT_FRAME_SIZE, &w, &h)) && w > 0 && h > 0) { videoW_ = int(w); videoH_ = int(h); }
+                        mt->GetUINT32(MF_MT_DEFAULT_STRIDE, &strideVal); mt->Release();
+                    }
+                    if (videoW_ > 0 && videoH_ > 0) {
+                        const int stride = (strideVal > 0) ? int(strideVal) : int(curLen / DWORD(videoH_));
+                        QImage img(data, videoW_, videoH_, stride > 0 ? stride : videoW_ * 4, QImage::Format_RGB32);
+                        videoFrame_ = QPixmap::fromImage(img.copy()); update();
+                    }
+                    buf->Unlock();
+                }
+                buf->Release();
+            }
+            sample->Release();
+        }
+#endif
+    }
+    void flushAudioBuffer() {
+#ifdef Q_OS_WIN
+        if (!audioAlias_.isEmpty()) { mciSendStringW(reinterpret_cast<LPCWSTR>(QStringLiteral("setaudio %1 volume to %2").arg(audioAlias_).arg(videoMuted_ ? 0 : int(videoVolume_ * 1000)).utf16()), nullptr, 0, nullptr); if (videoPlaying_) mciSendStringW(reinterpret_cast<LPCWSTR>(QStringLiteral("play %1 from %2").arg(audioAlias_).arg(audioPos100Ns_ / 10000LL).utf16()), nullptr, 0, nullptr); else mciSendStringW(reinterpret_cast<LPCWSTR>(QStringLiteral("seek %1 to %2").arg(audioAlias_).arg(audioPos100Ns_ / 10000LL).utf16()), nullptr, 0, nullptr); } if (waveOut_ && mfAudioReader_) {
+            waveOutReset(waveOut_);
+            PROPVARIANT var; PropVariantInit(&var); var.vt = VT_I8; var.hVal.QuadPart = audioPos100Ns_;
+            mfAudioReader_->SetCurrentPosition(GUID_NULL, var);
+            PropVariantClear(&var);
+        }
+#endif
+    }
+    void pumpAudioSamples() {
+#ifdef Q_OS_WIN
+        if (!mfAudioReader_ || !waveOut_ || !videoPlaying_) return;
+        for (int i = activeWaveHdrs_.size() - 1; i >= 0; --i) {
+            WAVEHDR *wh = activeWaveHdrs_.at(i);
+            if (wh->dwFlags & WHDR_DONE) {
+                waveOutUnprepareHeader(waveOut_, wh, sizeof(WAVEHDR));
+                delete[] wh->lpData;
+                delete wh;
+                activeWaveHdrs_.removeAt(i);
+            }
+        }
+        while (activeWaveHdrs_.size() < 8) {
+            DWORD streamIdx = 0, flags = 0; LONGLONG ts = 0; IMFSample *sample = nullptr;
+            HRESULT hr = mfAudioReader_->ReadSample(DWORD(MF_SOURCE_READER_FIRST_AUDIO_STREAM), 0, &streamIdx, &flags, &ts, &sample);
+            if (FAILED(hr) || (flags & MF_SOURCE_READERF_ENDOFSTREAM)) {
+                if (sample) sample->Release();
+                PROPVARIANT var; PropVariantInit(&var); var.vt = VT_I8; var.hVal.QuadPart = 0;
+                mfAudioReader_->SetCurrentPosition(GUID_NULL, var); PropVariantClear(&var);
+                if (isAudio_) {
+                    audioPos100Ns_ = 0;
+                    videoPlaying_ = false;
+                    if (audioTimer_) audioTimer_->stop();
+                    update();
+                }
+                break;
+            }
+            if (!sample) break;
+            IMFMediaBuffer *buf = nullptr;
+            if (SUCCEEDED(sample->ConvertToContiguousBuffer(&buf)) && buf) {
+                BYTE *data = nullptr; DWORD maxLen = 0, curLen = 0;
+                if (SUCCEEDED(buf->Lock(&data, &maxLen, &curLen)) && data && curLen > 0) {
+                    audioPos100Ns_ = ts;
+                    auto *wh = new WAVEHDR();
+                    wh->lpData = new char[curLen];
+                    const float gain = videoMuted_ ? 0.0f : videoVolume_;
+                    const int16_t *srcSamples = reinterpret_cast<const int16_t *>(data);
+                    int16_t *dstSamples = reinterpret_cast<int16_t *>(wh->lpData);
+                    const DWORD sampleCount = curLen / 2;
+                    for (DWORD s = 0; s < sampleCount; ++s) {
+                        dstSamples[s] = int16_t(qBound(-32768, int(srcSamples[s] * gain), 32767));
+                    }
+                    update();
+                    wh->dwBufferLength = curLen;
+                    if (waveOutPrepareHeader(waveOut_, wh, sizeof(WAVEHDR)) == MMSYSERR_NOERROR) {
+                        waveOutWrite(waveOut_, wh, sizeof(WAVEHDR));
+                        activeWaveHdrs_.append(wh);
+                    } else { delete[] wh->lpData; delete wh; }
+                    buf->Unlock();
+                }
+                buf->Release();
+            }
+            sample->Release();
+        }
+#endif
+    }
+    void pauseMedia() {
+        videoPlaying_ = false;
+        if (videoTimer_) videoTimer_->stop();
+        if (audioTimer_) audioTimer_->stop();
+#ifdef Q_OS_WIN
+        if (waveOut_) waveOutReset(waveOut_);
+#endif
+        update();
+    }
+    QString mediaPath() const { return mediaPath_; } int videoWidth() const { return videoW_; } int videoHeight() const { return videoH_; }
+protected:
+    void mousePressEvent(QGraphicsSceneMouseEvent *event) override {
+        if (selectionMode_ && event->button() == Qt::LeftButton) { event->ignore(); return; }
         if (event->button() == Qt::LeftButton && event->pos().x() >= width_-20 && event->pos().y() >= height_-20) {
-            resizing_ = true;
-            resizeStart_ = event->scenePos();
-            resizeStartWidth_ = width_;
-            resizeStartHeight_ = height_;
-            event->accept();
-            return;
+            resizing_ = true; resizeStart_ = event->scenePos(); resizeStartWidth_ = width_; resizeStartHeight_ = height_; event->accept(); return;
         }
         if (event->button() == Qt::LeftButton && event->pos().y() < 42 && event->pos().x() >= width_-36) {
-            if (deleteRequested) deleteRequested(this);
-            event->accept();
-            return;
+            if (deleteRequested) deleteRequested(this); event->accept(); return;
         }
-        dragging_ = event->button() == Qt::LeftButton;
-        lastScenePos_ = event->scenePos();
-        event->accept();
+        if ((isVideo_ || isAudio_) && event->button() == Qt::LeftButton && event->pos().y() >= 44 && event->pos().x() >= 8 && event->pos().x() < width_ - 14 && event->pos().y() < height_ - 14) {
+            const QRectF mediaRect(14, 50, qMax(40.0, width_ - 28.0), qMax(40.0, height_ - 66.0));
+            if (isVideo_) {
+                const QRectF barRect(mediaRect.left() + 8, mediaRect.bottom() - 32, qMin(150.0, mediaRect.width() - 16), 24);
+                const QRectF muteRect(barRect.left(), barRect.top(), 26, 24);
+                const QRectF sliderRect(barRect.left() + 26, barRect.top(), barRect.width() - 32, 24);
+                if (muteRect.contains(event->pos())) {
+                    videoMuted_ = !videoMuted_; flushAudioBuffer();
+                    update(); event->accept(); return;
+                } else if (sliderRect.contains(event->pos())) {
+                    videoMuted_ = false;
+                    videoVolume_ = float(qBound(0.0, (event->pos().x() - sliderRect.left()) / qMax(1.0, sliderRect.width()), 1.0));
+                    draggingVolume_ = true; flushAudioBuffer();
+                    update(); event->accept(); return;
+                }
+            } else if (isAudio_) {
+                const QRectF playHitZone(8, 44, 56, qMax(40.0, height_ - 54.0));
+                if (playHitZone.contains(event->pos())) {
+                    videoPlaying_ = !videoPlaying_;
+                    if (videoPlaying_) {
+                        if (mfAudioReader_ && waveOut_) {
+                            waveOutRestart(waveOut_);
+                            if (audioTimer_) audioTimer_->start(20);
+                            pumpAudioSamples();
+                        } else if (!audioAlias_.isEmpty()) {
+                            mciSendStringW(reinterpret_cast<LPCWSTR>(QStringLiteral("play %1 from %2").arg(audioAlias_).arg(audioPos100Ns_ / 10000LL).utf16()), nullptr, 0, nullptr);
+                            if (audioTimer_) audioTimer_->start(80);
+                        }
+                    } else {
+                        if (audioTimer_) audioTimer_->stop();
+                        if (waveOut_) waveOutPause(waveOut_);
+                        if (!audioAlias_.isEmpty()) mciSendStringW(reinterpret_cast<LPCWSTR>(QStringLiteral("pause %1").arg(audioAlias_).utf16()), nullptr, 0, nullptr);
+                    }
+                    update(); event->accept(); return;
+                }
+                const QRectF playBtn(mediaRect.left() + 10, mediaRect.center().y() - 18, 36, 36);
+                const qreal waveLeft = playBtn.right() + 12;
+                const qreal waveRight = mediaRect.right() - 12;
+                const qreal volLeft = qMax(waveLeft + 96, waveRight - 88);
+                const QRectF muteRect(volLeft, mediaRect.bottom() - 26, 22, 22);
+                const QRectF vTrack(volLeft + 24, mediaRect.bottom() - 24, qMax(30.0, waveRight - (volLeft + 26)), 20);
+                const QRectF waveRect(waveLeft, mediaRect.top() + 8, qMax(40.0, waveRight - waveLeft), qMax(22.0, mediaRect.height() - 36.0));
+                if (muteRect.contains(event->pos())) {
+                    videoMuted_ = !videoMuted_; flushAudioBuffer();
+                    update(); event->accept(); return;
+                } else if (vTrack.contains(event->pos())) {
+                    videoMuted_ = false;
+                    videoVolume_ = float(qBound(0.0, (event->pos().x() - vTrack.left()) / qMax(1.0, vTrack.width()), 1.0));
+                    draggingVolume_ = true; flushAudioBuffer();
+                    update(); event->accept(); return;
+                } else if (waveRect.contains(event->pos()) && mfAudioReader_ && audioDuration100Ns_ > 0) {
+                    const qreal ratio = qBound(0.0, (event->pos().x() - waveRect.left()) / qMax(1.0, waveRect.width()), 1.0);
+                    audioPos100Ns_ = LONGLONG(ratio * audioDuration100Ns_);
+                    flushAudioBuffer();
+                    draggingSeek_ = true;
+                    update(); event->accept(); return;
+                }
+            }
+            videoPlaying_ = !videoPlaying_;
+            if (videoTimer_) { if (videoPlaying_) videoTimer_->start(33); else videoTimer_->stop(); }
+            if (audioTimer_) { if (videoPlaying_) if (isAudio_) { videoPlaying_ = false; audioTimer_->stop(); } else { audioTimer_->start(20); } else audioTimer_->stop(); }
+            update(); event->accept(); return;
+        }
+        dragging_ = event->button() == Qt::LeftButton; lastScenePos_ = event->scenePos(); event->accept();
     }
-    void mouseDoubleClickEvent(QGraphicsSceneMouseEvent *event) override
-    {
-        if (event->button() == Qt::LeftButton && event->pos().y() < 42 && event->pos().x() < width_-48) {
-            editHeading();
-            event->accept();
-            return;
-        }
+    void mouseDoubleClickEvent(QGraphicsSceneMouseEvent *event) override {
+        if (event->button() == Qt::LeftButton && event->pos().y() < 42 && event->pos().x() < width_-48) { editHeading(); event->accept(); return; }
         QGraphicsObject::mouseDoubleClickEvent(event);
     }
-    void mouseMoveEvent(QGraphicsSceneMouseEvent *event) override
-    {
-        if (selectionMode_) {
-            QGraphicsObject::mouseMoveEvent(event);
-            return;
+    void mouseMoveEvent(QGraphicsSceneMouseEvent *event) override {
+        if (selectionMode_) { QGraphicsObject::mouseMoveEvent(event); return; }
+        if (draggingVolume_) {
+            const QRectF mediaRect(14, 50, qMax(40.0, width_ - 28.0), qMax(40.0, height_ - 66.0));
+            if (isVideo_) {
+                const QRectF barRect(mediaRect.left() + 8, mediaRect.bottom() - 32, qMin(150.0, mediaRect.width() - 16), 24);
+                videoVolume_ = float(qBound(0.0, (event->pos().x() - (barRect.left() + 26)) / qMax(1.0, barRect.width() - 32), 1.0));
+            } else if (isAudio_) {
+                const qreal waveLeft = mediaRect.left() + 58;
+                const qreal waveRight = mediaRect.right() - 12;
+                const qreal volLeft = qMax(waveLeft + 96, waveRight - 88);
+                videoVolume_ = float(qBound(0.0, (event->pos().x() - (volLeft + 24)) / qMax(1.0, waveRight - (volLeft + 26)), 1.0));
+            }
+            update(); event->accept(); return;
+        }
+        if (draggingSeek_ && isAudio_ && mfAudioReader_ && audioDuration100Ns_ > 0) {
+            const qreal waveLeft = 14 + 58;
+            const qreal waveRight = width_ - 26;
+            const qreal ratio = qBound(0.0, (event->pos().x() - waveLeft) / qMax(1.0, waveRight - waveLeft), 1.0);
+            audioPos100Ns_ = LONGLONG(ratio * audioDuration100Ns_);
+            PROPVARIANT var; PropVariantInit(&var); var.vt = VT_I8; var.hVal.QuadPart = audioPos100Ns_;
+            mfAudioReader_->SetCurrentPosition(GUID_NULL, var); PropVariantClear(&var);
+            update(); event->accept(); return;
         }
         if (resizing_) {
+            if (!mediaPath_.isEmpty() && (event->modifiers() & Qt::ShiftModifier)) {
+                qreal natW = pixmap_.width(), natH = pixmap_.height();
+                if (isGif_ && movie_ && movie_->isValid()) { natW = movie_->currentPixmap().width(); natH = movie_->currentPixmap().height(); }
+                else if (isVideo_ && videoW_ > 0 && videoH_ > 0) { natW = videoW_; natH = videoH_; }
+                if (natW > 0 && natH > 0) {
+                    const qreal newW = qMax(180.0, resizeStartWidth_ + (event->scenePos().x() - resizeStart_.x()));
+                    manualWidth_ = newW; manualHeight_ = qMax(140.0, (newW - 28.0) * (natH / natW) + 66.0);
+                    resizeToContent(); event->accept(); return;
+                }
+            }
             const QPointF delta = event->scenePos()-resizeStart_;
             manualWidth_=qMax(baseWidth_,resizeStartWidth_+delta.x());
             manualHeight_=qMax(baseHeight_,resizeStartHeight_+delta.y());
-            resizeToContent();
-            event->accept();
-            return;
+            resizeToContent(); event->accept(); return;
         }
         if (!dragging_) return;
-        const QPointF delta = event->scenePos() - lastScenePos_;
-        setPos(pos() + delta);
-        lastScenePos_ = event->scenePos();
-        event->accept();
+        setPos(pos() + (event->scenePos() - lastScenePos_)); lastScenePos_ = event->scenePos(); event->accept();
     }
-    void mouseReleaseEvent(QGraphicsSceneMouseEvent *event) override
-    {
-        if (selectionMode_) { QGraphicsObject::mouseReleaseEvent(event); return; }
+    void mouseReleaseEvent(QGraphicsSceneMouseEvent *event) override {
+        if (selectionMode_) { QGraphicsObject::mouseReleaseEvent(event); return; } if (draggingVolume_ || draggingSeek_) { draggingVolume_ = false; draggingSeek_ = false; event->accept(); return; }
         if (resizing_) { resizing_=false; if(contentChanged)contentChanged(); event->accept(); return; }
-        dragging_ = false;
-        event->accept();
+        dragging_ = false; event->accept();
     }
-    QVariant itemChange(GraphicsItemChange change, const QVariant &value) override
-    {
+    QVariant itemChange(GraphicsItemChange change, const QVariant &value) override {
         const QVariant result=QGraphicsObject::itemChange(change,value);
         if(change==QGraphicsItem::ItemPositionHasChanged&&moved)moved();
         return result;
     }
 private:
     void resizeToContent(){
-        const QFontMetricsF metrics(editor_->font());
-        qreal longest=0;
+        if (!mediaPath_.isEmpty()) {
+            const qreal w = qMax(180.0, manualWidth_), h = qMax(isAudio_ ? 116.0 : 140.0, manualHeight_);
+            const bool ch = (qAbs(w - width_) > 1.0 || qAbs(h - height_) > 1.0);
+            if (ch) { prepareGeometryChange(); width_ = w; height_ = h; }
+            headingEditor_->setFixedWidth(qMax(100, int(width_ - 62))); update();
+            if (ch && geometryChanged) geometryChanged();
+            return;
+        }
+        const QFontMetricsF metrics(editor_->font()); qreal longest=0;
         for(const QString &line:content_.split(QLatin1Char('\n'))) longest=qMax(longest,metrics.horizontalAdvance(line));
-        const qreal wantedWidth=qMax(baseWidth_,qMax(manualWidth_,longest+42.0));
-        bool changed=false;
+        const qreal wantedWidth=qMax(baseWidth_,qMax(manualWidth_,longest+42.0)); bool changed=false;
         if(qAbs(wantedWidth-width_)>1.0){prepareGeometryChange();width_=wantedWidth;changed=true;}
-        editor_->setFixedWidth(qMax(158,int(width_-42)));
-        headingEditor_->setFixedWidth(qMax(100,int(width_-62)));
-        proxy_->resize(width_-42,height_-68);
+        editor_->setFixedWidth(qMax(158,int(width_-42))); headingEditor_->setFixedWidth(qMax(100,int(width_-62))); proxy_->resize(width_-42,height_-68);
         editor_->document()->setTextWidth(qMax(100.0,width_-48.0));
         const qreal documentHeight=editor_->document()->documentLayout()->documentSize().height();
         const qreal wantedHeight=qMax(baseHeight_,qMax(manualHeight_,documentHeight+68.0));
         if(qAbs(wantedHeight-height_)>1.0){prepareGeometryChange();height_=wantedHeight;changed=true;}
-        editor_->setFixedHeight(qMax(52,int(height_-68)));
-        proxy_->resize(width_-42,height_-68);
-        update();
+        editor_->setFixedHeight(qMax(52,int(height_-68))); proxy_->resize(width_-42,height_-68); update();
         if(changed&&geometryChanged)geometryChanged();
     }
-    QString heading_;
-    QString content_;
-    QString accent_;
-    QString id_;
-    QString theme_;
-    qreal width_=260;
-    qreal height_=160;
-    qreal manualWidth_=260;
-    qreal manualHeight_=160;
-    qreal baseWidth_=260;
-    qreal baseHeight_=160;
-    QTextEdit *editor_=nullptr;
-    QLineEdit *headingEditor_=nullptr;
-    QGraphicsProxyWidget *proxy_=nullptr;
-    QGraphicsProxyWidget *headingProxy_=nullptr;
-    QPointF lastScenePos_;
-    QPointF resizeStart_;
-    qreal resizeStartWidth_=260;
-    qreal resizeStartHeight_=174;
-    bool dragging_=false;
-    bool resizing_=false;
-    bool selectionMode_=false;
+    QString heading_, content_, accent_, id_, theme_;
+    qreal width_=260, height_=160, manualWidth_=260, manualHeight_=160, baseWidth_=260, baseHeight_=160;
+    QTextEdit *editor_=nullptr; QLineEdit *headingEditor_=nullptr;
+    QGraphicsProxyWidget *proxy_=nullptr; QGraphicsProxyWidget *headingProxy_=nullptr;
+    QPointF lastScenePos_, resizeStart_; qreal resizeStartWidth_=260, resizeStartHeight_=174;
+    bool dragging_=false, resizing_=false, selectionMode_=false;
+    QString mediaPath_; QPixmap pixmap_; QMovie *movie_ = nullptr; bool isGif_ = false, isVideo_ = false, isAudio_ = false; float videoVolume_ = 0.85f; LONGLONG audioDuration100Ns_ = 0; LONGLONG audioPos100Ns_ = 0; bool draggingVolume_ = false; bool draggingSeek_ = false;
+    QTimer *videoTimer_ = nullptr; bool videoPlaying_ = false; bool videoMuted_ = false; QString audioAlias_; int videoW_ = 0, videoH_ = 0; QPixmap videoFrame_;
+#ifdef Q_OS_WIN
+    IMFSourceReader *mfReader_ = nullptr;
+    IMFSourceReader *mfAudioReader_ = nullptr;
+    HWAVEOUT waveOut_ = nullptr;
+    QTimer *audioTimer_ = nullptr;
+    QList<WAVEHDR *> activeWaveHdrs_;
+#endif
+public:
+    ~NoteCard() override {
+        if (movie_) { movie_->stop(); delete movie_; }
+        if (videoTimer_) { videoTimer_->stop(); delete videoTimer_; }
+        if (audioTimer_) { audioTimer_->stop(); delete audioTimer_; }
+#ifdef Q_OS_WIN
+        if (waveOut_) { waveOutReset(waveOut_); waveOutClose(waveOut_); waveOut_ = nullptr; }
+        if (mfReader_) { mfReader_->Release(); mfReader_ = nullptr; }
+        if (mfAudioReader_) { mfAudioReader_->Release(); mfAudioReader_ = nullptr; }
+#endif
+    }
 };
 
 class NoteEdge final : public QGraphicsPathItem {
 public:
-    NoteEdge(NoteCard *from, NoteCard *to) : from_(from), to_(to)
-    {
+    NoteEdge(NoteCard *from, NoteCard *to) : from_(from), to_(to) {
         QPen edgePen(QColor(QStringLiteral("#ffffff")), 2.0, Qt::SolidLine, Qt::RoundCap); edgePen.setCosmetic(true);
         setPen(edgePen); setBrush(Qt::NoBrush); setZValue(1);
-        setFlag(QGraphicsItem::ItemSendsGeometryChanges);
-        setFlag(QGraphicsItem::ItemIsSelectable);
-        setAcceptedMouseButtons(Qt::LeftButton | Qt::RightButton);
-        setToolTip(QStringLiteral("Кликните, чтобы удалить ветку"));
-        refresh();
+        setFlag(QGraphicsItem::ItemSendsGeometryChanges); setFlag(QGraphicsItem::ItemIsSelectable);
+        setAcceptedMouseButtons(Qt::LeftButton | Qt::RightButton); refresh();
     }
     std::function<void(NoteEdge *)> deleteRequested;
-    void refresh()
-    {
+    NoteCard *from() const { return from_; } NoteCard *to() const { return to_; }
+    bool touches(const NoteCard *card) const { return from_ == card || to_ == card; }
+    void refresh() {
         if (!from_ || !to_) return;
-        const QRectF fromRect=from_->sceneBoundingRect();
-        const QRectF toRect=to_->sceneBoundingRect();
-        const QPointF fromCenter=fromRect.center(),toCenter=toRect.center();
-        const QPointF direction=toCenter-fromCenter;
-        auto borderPoint=[](const QRectF &rect,const QPointF &toward){
-            const QPointF center=rect.center(),delta=toward-center;
-            const qreal dx=qAbs(delta.x())<0.001?1e9:(rect.width()/2.0)/qAbs(delta.x());
-            const qreal dy=qAbs(delta.y())<0.001?1e9:(rect.height()/2.0)/qAbs(delta.y());
-            return center+delta*qMin(dx,dy);
+        const QRectF fromRect = from_->sceneBoundingRect(), toRect = to_->sceneBoundingRect();
+        const QPointF fromCenter = fromRect.center(), toCenter = toRect.center(), direction = toCenter - fromCenter;
+        auto borderPoint = [](const QRectF &rect, const QPointF &toward) {
+            const QPointF center = rect.center(), delta = toward - center;
+            const qreal dx = qAbs(delta.x()) < 0.001 ? 1e9 : (rect.width() / 2.0) / qAbs(delta.x());
+            const qreal dy = qAbs(delta.y()) < 0.001 ? 1e9 : (rect.height() / 2.0) / qAbs(delta.y());
+            return center + delta * qMin(dx, dy);
         };
-        const QPointF a=borderPoint(fromRect,toCenter);
-        const QPointF b=borderPoint(toRect,fromCenter);
-        QPainterPath path(a);
-        const qreal bend = qMax(36.0,qAbs(direction.x()) * 0.35);
-        const QPointF tangentA=a+QPointF(direction.x()>=0?bend:-bend,0);
-        const QPointF tangentB=b-QPointF(direction.x()>=0?bend:-bend,0);
-        path.cubicTo(tangentA,tangentB,b);
-        setPath(path);
-    }
-    bool touches(NoteCard *card) const { return from_ == card || to_ == card; }
-    NoteCard *from() const { return from_; }
-    NoteCard *to() const { return to_; }
-    QRectF boundingRect() const override { return QGraphicsPathItem::boundingRect().adjusted(-8, -8, 8, 8); }
-    QPainterPath shape() const override
-    {
-        QPainterPathStroker stroker; stroker.setWidth(14); return stroker.createStroke(path());
+        const QPointF start = borderPoint(fromRect, toCenter), end = borderPoint(toRect, fromCenter);
+        const qreal span = qMax(54.0, qAbs(direction.x()) * 0.42), sign = direction.x() >= 0 ? 1.0 : -1.0;
+        QPainterPath path(start); path.cubicTo(start + QPointF(span * sign, 0), end - QPointF(span * sign, 0), end); setPath(path);
     }
 protected:
-    void mousePressEvent(QGraphicsSceneMouseEvent *event) override
-    {
-        if (event->button() == Qt::RightButton || event->button() == Qt::LeftButton) {
-            if (deleteRequested) deleteRequested(this);
-            event->accept();
-            return;
-        }
+    void mousePressEvent(QGraphicsSceneMouseEvent *event) override {
+        if (deleteRequested && (event->button() == Qt::LeftButton || event->button() == Qt::RightButton)) { deleteRequested(this); event->accept(); return; }
         QGraphicsPathItem::mousePressEvent(event);
     }
 private:
-    NoteCard *from_;
-    NoteCard *to_;
+    NoteCard *from_; NoteCard *to_;
 };
-
 class NotesView final : public QGraphicsView {
 public:
-    explicit NotesView(QGraphicsScene *scene, QWidget *parent = nullptr) : QGraphicsView(scene, parent)
-    {
+    explicit NotesView(QGraphicsScene *scene, QWidget *parent = nullptr) : QGraphicsView(scene, parent) {
         setRenderHints(QPainter::Antialiasing | QPainter::SmoothPixmapTransform | QPainter::TextAntialiasing);
-        setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
-        setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        setFrameShape(QFrame::NoFrame);
-        setBackgroundBrush(Qt::NoBrush);
-        setMouseTracking(true);
+        setViewportUpdateMode(QGraphicsView::MinimalViewportUpdate);
+        setOptimizationFlag(QGraphicsView::DontAdjustForAntialiasing, true);
+        setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff); setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        setFrameShape(QFrame::NoFrame); setBackgroundBrush(Qt::NoBrush); setMouseTracking(true);
+        setAcceptDrops(true); if (viewport()) viewport()->setAcceptDrops(true);
     }
-
-    std::function<void(const QPointF &)> addAt;
-    std::function<void(QGraphicsItem *)> linkAt;
-    std::function<void(NoteCard *)> startLinkAt;
-    std::function<bool()> hasLinkStart;
-    std::function<bool(NoteCard *)> isLinkStart;
-    std::function<void(const QPointF &)> previewAt;
-    std::function<void()> cancelLink;
-    std::function<void()> leaveNotes;
-    bool drawMode_ = false;
-    bool eraseMode_ = false;
-    bool linkMode_ = false;
-    bool selectMode_ = false;
-    void setZoomOutLimit(int percent) { minimumZoom_ = qBound(0.10, percent / 100.0, 0.50); if (zoom_ < minimumZoom_) { const qreal factor = minimumZoom_ / zoom_; zoom_ = minimumZoom_; scale(factor, factor); } }
-    QString drawColor_ = QStringLiteral("#a78bfa");
-    qreal brushWidth_ = 3.0;
-    QPointF lastDrawPt_;
-    bool isDrawing_ = false;
+    std::function<void(const QPointF &)> addAt; std::function<void(QGraphicsItem *)> linkAt;
+    std::function<void(NoteCard *)> startLinkAt; std::function<bool()> hasLinkStart;
+    std::function<bool(NoteCard *)> isLinkStart; std::function<void(const QPointF &)> previewAt;
+    std::function<void()> cancelLink; std::function<void()> leaveNotes;
+    std::function<void(const QStringList &, const QPointF &)> filesDroppedAt;
+    bool drawMode_ = false, eraseMode_ = false, linkMode_ = false, selectMode_ = false;
+    void setZoomOutLimit(int percent) { minimumZoom_ = qBound(0.10, percent / 100.0, 0.50); if (zoom_ < minimumZoom_) { const qreal f = minimumZoom_ / zoom_; zoom_ = minimumZoom_; scale(f, f); } }
+    QString drawColor_ = QStringLiteral("#a78bfa"); qreal brushWidth_ = 3.0; QPointF lastDrawPt_; bool isDrawing_ = false;
     QList<QGraphicsPathItem *> drawnItems_;
-
-    void clearStrokes()
-    {
-        for (auto *it : drawnItems_) { scene()->removeItem(it); delete it; }
-        drawnItems_.clear();
-    }
-    void undoStroke() { if (drawnItems_.isEmpty()) return; auto *it=drawnItems_.takeLast(); scene()->removeItem(it); delete it; }
-
+    void clearStrokes() { for (auto *it : drawnItems_) { scene()->removeItem(it); delete it; } drawnItems_.clear(); }
+    void undoStroke() { if (drawnItems_.isEmpty()) return; auto *it = drawnItems_.takeLast(); scene()->removeItem(it); delete it; }
 protected:
-    NoteCard *cardAt(const QPoint &position) const
-    {
+    NoteCard *cardAt(const QPoint &position) const {
         for (QGraphicsItem *hit : scene()->items(mapToScene(position))) {
-            QGraphicsItem *root=hit;
-            while(root->parentItem()) root=root->parentItem();
-            if(auto *card=dynamic_cast<NoteCard *>(root)) return card;
+            QGraphicsItem *root = hit; while (root->parentItem()) root = root->parentItem();
+            if (auto *card = dynamic_cast<NoteCard *>(root)) return card;
         }
         return nullptr;
     }
-
-    void drawBackground(QPainter *painter, const QRectF &rect) override
-    {
+    void dragEnterEvent(QDragEnterEvent *e) override { if (e->mimeData() && e->mimeData()->hasUrls()) e->acceptProposedAction(); else QGraphicsView::dragEnterEvent(e); }
+    void dragMoveEvent(QDragMoveEvent *e) override { if (e->mimeData() && e->mimeData()->hasUrls()) e->acceptProposedAction(); else QGraphicsView::dragMoveEvent(e); }
+    void dropEvent(QDropEvent *e) override {
+        if (e->mimeData() && e->mimeData()->hasUrls()) {
+            QStringList paths; for (const QUrl &u : e->mimeData()->urls()) if (u.isLocalFile()) paths.append(u.toLocalFile());
+            if (!paths.isEmpty() && filesDroppedAt) filesDroppedAt(paths, mapToScene(e->position().toPoint()));
+            e->acceptProposedAction(); return;
+        }
+        QGraphicsView::dropEvent(e);
+    }
+    void drawBackground(QPainter *painter, const QRectF &rect) override {
         painter->save();
-        painter->fillRect(rect, QColor(10, 13, 20, 175));
-        const qreal step = 36.0;
-        const int alpha = qBound(14, int(zoom_ * 48.0), 115);
-        const qreal radius = qBound(0.9, zoom_ * 1.35, 2.2);
-        painter->setPen(Qt::NoPen);
-        painter->setBrush(QColor(210, 225, 255, alpha));
-        const qreal left = std::floor(rect.left() / step) * step;
-        const qreal top = std::floor(rect.top() / step) * step;
-        for (qreal x = left; x < rect.right(); x += step) {
-            for (qreal y = top; y < rect.bottom(); y += step) {
-                painter->drawEllipse(QPointF(x, y), radius, radius);
-            }
+        painter->fillRect(rect, QColor(14, 17, 23, 240));
+        qreal step = 28.0; while (step * zoom_ < 14.0) step *= 2.0;
+        if (step <= 224.0) {
+            painter->setPen(Qt::NoPen); painter->setBrush(QColor(180, 195, 215, 26));
+            const qreal left = std::floor(rect.left() / step) * step, top = std::floor(rect.top() / step) * step;
+            for (qreal x = left; x < rect.right(); x += step)
+                for (qreal y = top; y < rect.bottom(); y += step)
+                    painter->drawEllipse(QPointF(x, y), 1.15, 1.15);
         }
         painter->restore();
     }
-
-        void keyPressEvent(QKeyEvent *event) override
+    void keyPressEvent(QKeyEvent *event) override
     {
         if (event->key() == Qt::Key_Escape) {
             if (cancelLink) cancelLink();
@@ -1069,11 +1459,27 @@ protected:
         QGraphicsView::wheelEvent(event);
     }
 
+    QSet<QGraphicsItem *> prevSelected_;
+    QPoint rubberOrigin_;
     void mousePressEvent(QMouseEvent *event) override
     {
-        const bool linkGesture=(linkMode_&&event->button()==Qt::LeftButton)
-            || event->button()==Qt::RightButton || event->button()==Qt::MiddleButton
-            || (event->button()==Qt::LeftButton&&(event->modifiers()&Qt::ShiftModifier));
+        if (selectMode_ && event->button() == Qt::LeftButton) {
+            movingSelection_ = false;
+            panning_ = false;
+            prevSelected_.clear();
+            for (QGraphicsItem *it : scene()->selectedItems()) prevSelected_.insert(it);
+            rubberOrigin_ = event->pos();
+            setDragMode(QGraphicsView::RubberBandDrag);
+            QGraphicsView::mousePressEvent(event);
+            for (QGraphicsItem *it : prevSelected_) it->setSelected(true);
+            event->accept();
+            return;
+        }
+        mousePressEventInner(event);
+    }
+    void mousePressEventInner(QMouseEvent *event)
+    {
+        const bool linkGesture = (linkMode_ && event->button() == Qt::LeftButton);
         if(linkGesture){
             if(NoteCard *card=cardAt(event->position().toPoint())){
                 if(hasLinkStart&&!hasLinkStart()&&startLinkAt)startLinkAt(card);
@@ -1119,7 +1525,20 @@ protected:
             event->accept();
             return;
         }
+        if (selectMode_ && event->button() == Qt::LeftButton) {
+            prevSelected_.clear();
+            for (QGraphicsItem *it : scene()->selectedItems()) prevSelected_.insert(it);
+            rubberOrigin_ = event->pos();
+            if (!cardAt(event->pos())) {
+                setDragMode(QGraphicsView::RubberBandDrag);
+            } else {
+                setDragMode(QGraphicsView::NoDrag);
+            }
+        }
         QGraphicsView::mousePressEvent(event);
+        if (selectMode_ && event->button() == Qt::LeftButton) {
+            for (QGraphicsItem *it : prevSelected_) it->setSelected(true);
+        }
     }
 
     void mouseMoveEvent(QMouseEvent *event) override
@@ -1159,6 +1578,36 @@ protected:
     }
 
     void mouseReleaseEvent(QMouseEvent *event) override
+    {
+        if (selectMode_ && event->button() == Qt::LeftButton) {
+            const QRect band = QRect(rubberOrigin_, event->pos()).normalized();
+            QGraphicsView::mouseReleaseEvent(event);
+            setDragMode(QGraphicsView::NoDrag);
+            setCursor(Qt::ArrowCursor);
+            QSet<QGraphicsItem *> hitSet;
+            if (band.width() > 4 || band.height() > 4) {
+                for (QGraphicsItem *hit : scene()->items(mapToScene(band))) {
+                    QGraphicsItem *root = hit; while (root->parentItem()) root = root->parentItem();
+                    if (dynamic_cast<NoteCard *>(root)) hitSet.insert(root);
+                }
+            } else if (NoteCard *clickedCard = cardAt(event->pos())) {
+                hitSet.insert(clickedCard);
+            }
+            for (QGraphicsItem *it : scene()->items()) {
+                if (dynamic_cast<NoteCard *>(it)) {
+                    const bool wasSel = prevSelected_.contains(it);
+                    const bool inBand = hitSet.contains(it);
+                    it->setSelected(inBand ? !wasSel : wasSel);
+                }
+            }
+            scene()->update();
+            return;
+        }
+        panning_ = false; if (viewport()) viewport()->unsetCursor(); if (dragMode() == QGraphicsView::ScrollHandDrag) setDragMode(QGraphicsView::NoDrag);
+        unsetCursor();
+        QGraphicsView::mouseReleaseEvent(event);
+    }
+    void mouseReleaseEventUnused(QMouseEvent *event)
     {
         if (drawMode_ && isDrawing_) { isDrawing_ = false; event->accept(); return; }
         if (panning_) {
@@ -1309,7 +1758,123 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
         navButton->setIconSize(QSize(8, 8));
         navButton->setStyleSheet(QStringLiteral("QPushButton{text-align:left;padding:6px 10px;}"));
     }
-    navLayout->addWidget(notesNavButton_);
+    QSettings boardStore(QString::fromLatin1(kSettingsOrg), QString::fromLatin1(kSettingsApp));
+    const QStringList storedBoards = boardStore.value(QStringLiteral("noteBoardNames")).toStringList();
+    if (!storedBoards.isEmpty()) s_noteBoardNames = storedBoards;
+
+    auto *boardsDrawer = new QFrame(nav_);
+    boardsDrawer->setVisible(false);
+    boardsDrawer->setStyleSheet(QStringLiteral("QFrame{background:rgba(255,255,255,0.055);border:1px solid rgba(255,255,255,0.12);border-radius:12px;}"));
+    auto *boardsLay = new QVBoxLayout(boardsDrawer);
+    boardsLay->setContentsMargins(6, 5, 6, 6);
+    boardsLay->setSpacing(4);
+
+
+    auto *boardsListBox = new QWidget(boardsDrawer);
+    auto *boardsListLay = new QVBoxLayout(boardsListBox);
+    boardsListLay->setContentsMargins(0, 0, 0, 0);
+    boardsListLay->setSpacing(3);
+    boardsLay->addWidget(boardsListBox);
+
+    auto *newBoardBtn = new QPushButton(QStringLiteral("+ Новое поле"), boardsDrawer);
+    newBoardBtn->setCursor(Qt::PointingHandCursor);
+    newBoardBtn->setStyleSheet(QStringLiteral("QPushButton{background:rgba(126,184,218,0.20);border:1px solid rgba(126,184,218,0.38);border-radius:8px;padding:6px 10px;color:#e3f2fa;font-size:12px;font-weight:600;text-align:left;}QPushButton:hover{background:rgba(126,184,218,0.32);}"));
+    boardsLay->addWidget(newBoardBtn);
+
+    auto rebuildBoardsMenu = std::make_shared<std::function<void()>>();
+    *rebuildBoardsMenu = [this, boardsListBox, boardsListLay, rebuildBoardsMenu]() {
+        while (QLayoutItem *it = boardsListLay->takeAt(0)) {
+            if (it->widget()) it->widget()->deleteLater();
+            delete it;
+        }
+        for (int i = 0; i < s_noteBoardNames.size(); ++i) {
+            auto *row = new QHBoxLayout;
+            row->setContentsMargins(0, 0, 0, 0);
+            row->setSpacing(3);
+            const bool active = (i == s_activeNoteBoard);
+            auto *bBtn = new QPushButton(s_noteBoardNames.at(i), boardsListBox);
+            bBtn->setIcon(navigationDotIcon(active));
+            bBtn->setIconSize(QSize(7, 7));
+            bBtn->setCursor(Qt::PointingHandCursor);
+            bBtn->setStyleSheet(active
+                ? QStringLiteral("QPushButton{background:rgba(255,255,255,0.16);border:0;border-radius:7px;padding:6px 8px;color:#fff;font-weight:600;text-align:left;font-size:12.5px;}")
+                : QStringLiteral("QPushButton{background:transparent;border:0;border-radius:7px;padding:6px 8px;color:rgba(235,240,248,0.75);text-align:left;font-size:12.5px;}QPushButton:hover{background:rgba(255,255,255,0.09);color:#fff;}"));
+            connect(bBtn, &QPushButton::clicked, this, [this, i, rebuildBoardsMenu]() {
+                if (i != s_activeNoteBoard) {
+                    saveNotes();
+                    s_activeNoteBoard = i;
+                    if (noteScene_) { noteScene_->clear(); noteEdges_.clear(); linkStart_ = nullptr; previewPath_ = nullptr; previewGlow_ = nullptr; }
+                    if (noteView_) static_cast<NotesView *>(noteView_)->clearStrokes();
+                    loadNotes();
+                }
+                setNotesVisible(true);
+                QTimer::singleShot(0, this, [rebuildBoardsMenu] { if (*rebuildBoardsMenu) (*rebuildBoardsMenu)(); });
+            });
+            row->addWidget(bBtn, 1);
+            if (i > 0) {
+                auto *delB = new QPushButton(QStringLiteral("×"), boardsListBox);
+                delB->setFixedSize(20, 20); delB->setCursor(Qt::PointingHandCursor); delB->setToolTip(QStringLiteral("Удалить поле"));
+                delB->setStyleSheet(QStringLiteral("QPushButton{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:rgba(235,240,248,0.6);font-size:12px;font-weight:600;padding:0;min-height:20px;max-width:20px;}QPushButton:hover{background:rgba(255,95,86,0.28);border-color:rgba(255,110,100,0.65);color:#ffd6d3;}"));
+                connect(delB, &QPushButton::clicked, this, [this, i, rebuildBoardsMenu]() {
+                    QFile::remove(QStringLiteral("%1/notes_board_%2.json").arg(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).arg(i));
+                    s_noteBoardNames.removeAt(i);
+                    QSettings st(QString::fromLatin1(kSettingsOrg), QString::fromLatin1(kSettingsApp));
+                    st.setValue(QStringLiteral("noteBoardNames"), s_noteBoardNames);
+                    if (s_activeNoteBoard >= s_noteBoardNames.size()) s_activeNoteBoard = 0;
+                    if (noteScene_) { noteScene_->clear(); noteEdges_.clear(); }
+                    loadNotes();
+                    QTimer::singleShot(0, this, [rebuildBoardsMenu] { if (*rebuildBoardsMenu) (*rebuildBoardsMenu)(); });
+                });
+                row->addWidget(delB);
+            }
+            auto *wrap = new QWidget(boardsListBox);
+            wrap->setLayout(row);
+            boardsListLay->addWidget(wrap);
+        }
+    };
+    (*rebuildBoardsMenu)();
+
+    connect(newBoardBtn, &QPushButton::clicked, this, [this, rebuildBoardsMenu]() {
+        bool ok = false;
+        const QString name = QInputDialog::getText(this, QStringLiteral("Новое поле заметок"), QStringLiteral("Название страницы:"), QLineEdit::Normal, QStringLiteral("Поле %1").arg(s_noteBoardNames.size() + 1), &ok).trimmed();
+        if (!ok || name.isEmpty()) return;
+        saveNotes();
+        s_noteBoardNames.append(name);
+        QSettings st(QString::fromLatin1(kSettingsOrg), QString::fromLatin1(kSettingsApp));
+        st.setValue(QStringLiteral("noteBoardNames"), s_noteBoardNames);
+        s_activeNoteBoard = s_noteBoardNames.size() - 1;
+        if (noteScene_) { noteScene_->clear(); noteEdges_.clear(); linkStart_ = nullptr; previewPath_ = nullptr; previewGlow_ = nullptr; }
+        if (noteView_) static_cast<NotesView *>(noteView_)->clearStrokes();
+        saveNotes();
+        setNotesVisible(true);
+        QTimer::singleShot(0, this, [rebuildBoardsMenu] { if (*rebuildBoardsMenu) (*rebuildBoardsMenu)(); });
+    });
+
+    auto *notesRowWidget = new QWidget(nav_);
+    auto *notesRowLayout = new QHBoxLayout(notesRowWidget);
+    notesRowLayout->setContentsMargins(0, 0, 0, 0);
+    notesRowLayout->setSpacing(0);
+
+    notesNavButton_->setStyleSheet(QStringLiteral("QPushButton{text-align:left;padding:6px 10px;border-top-right-radius:0px;border-bottom-right-radius:0px;border-right:1px solid rgba(255,255,255,0.15);}"));
+
+    auto *boardsArrowBtn = new QPushButton(QStringLiteral("▴"), notesRowWidget);
+    boardsArrowBtn->setFixedWidth(28);
+    boardsArrowBtn->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
+    boardsArrowBtn->setCursor(Qt::PointingHandCursor);
+    boardsArrowBtn->setToolTip(QStringLiteral("Показать / скрыть список полей заметок"));
+    boardsArrowBtn->setStyleSheet(QStringLiteral("QPushButton{border-top-left-radius:0px;border-bottom-left-radius:0px;border-left:0px;padding:0;min-width:28px;max-width:28px;color:rgba(235,240,248,0.85);font-size:12px;}QPushButton:hover{color:#fff;}"));
+
+    connect(boardsArrowBtn, &QPushButton::clicked, this, [boardsDrawer, boardsArrowBtn]() {
+        const bool nextOpen = !boardsDrawer->isVisible();
+        boardsDrawer->setVisible(nextOpen);
+        boardsArrowBtn->setText(nextOpen ? QStringLiteral("▾") : QStringLiteral("▴"));
+    });
+
+    notesRowLayout->addWidget(notesNavButton_, 1);
+    notesRowLayout->addWidget(boardsArrowBtn);
+
+    navLayout->addWidget(boardsDrawer);
+    navLayout->addWidget(notesRowWidget);
     navLayout->addWidget(settingsNavButton_);
     columns->addWidget(nav_);
 
@@ -1375,6 +1940,34 @@ auto *bindScroll = new QScrollArea(drawerContent_);
     drawBtn->setCheckable(true);
     
     noteScene_ = new QGraphicsScene(this); noteScene_->setItemIndexMethod(QGraphicsScene::NoIndex); auto *view = new NotesView(noteScene_, notesPage_); noteView_ = view;
+    view->filesDroppedAt = [this](const QStringList &files, const QPointF &scenePos) {
+        const QString mediaDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/notes_media");
+        QDir().mkpath(mediaDir); QPointF offset(0, 0);
+        for (const QString &src : files) {
+            const QFileInfo fi(src); const QString ext = fi.suffix().toLower();
+            const QStringList ok = {QStringLiteral("png"),QStringLiteral("jpg"),QStringLiteral("jpeg"),QStringLiteral("webp"),QStringLiteral("bmp"),QStringLiteral("tiff"),QStringLiteral("tif"),QStringLiteral("ico"),QStringLiteral("svg"),QStringLiteral("gif"),QStringLiteral("mp4"),QStringLiteral("webm"),QStringLiteral("mkv"),QStringLiteral("avi"),QStringLiteral("mov"),QStringLiteral("m4v"),QStringLiteral("wmv"),QStringLiteral("mp3"),QStringLiteral("wav"),QStringLiteral("ogg"),QStringLiteral("flac"),QStringLiteral("m4a"),QStringLiteral("aac"),QStringLiteral("opus"),QStringLiteral("wma")};
+            if (!ok.contains(ext)) continue;
+            const QString dst = QDir(mediaDir).filePath(QStringLiteral("%1_%2").arg(QDateTime::currentMSecsSinceEpoch()).arg(fi.fileName()));
+            if (QFile::copy(src, dst)) {
+                if (auto *card = dynamic_cast<NoteCard *>(createNote(scenePos + offset, fi.completeBaseName(), QString()))) {
+                    card->setMediaFile(dst); QImageReader r(dst); const QSize sz = r.size();
+                    if (sz.isValid() && sz.width() > 0) {
+                        const qreal w = qBound(240.0, qreal(sz.width()), 480.0);
+                        card->setStoredSize(w, qBound(180.0, w * qreal(sz.height()) / qreal(sz.width()) + 66.0, 560.0));
+                    } else if (card->videoWidth() > 0 && card->videoHeight() > 0) {
+                        const qreal w = qBound(280.0, qreal(card->videoWidth()), 520.0);
+                        card->setStoredSize(w, qBound(180.0, w * qreal(card->videoHeight()) / qreal(card->videoWidth()) + 66.0, 580.0));
+                    } else if (QStringList{QStringLiteral("mp3"),QStringLiteral("wav"),QStringLiteral("ogg"),QStringLiteral("flac"),QStringLiteral("m4a"),QStringLiteral("aac"),QStringLiteral("opus"),QStringLiteral("wma")}.contains(ext)) {
+                        card->setStoredSize(340.0, 126.0);
+                    } else {
+                        card->setStoredSize(340.0, 250.0);
+                    }
+                    saveNotes();
+                }
+                offset += QPointF(28, 28);
+            }
+        }
+    };
     view->setZoomOutLimit(notesZoomOutPercent_);
     view->setFocusPolicy(Qt::StrongFocus); auto *brushBtn = button(QStringLiteral("Палитра"), notesPage_);
     auto *brushSize = new AppleStepper(3,1,16,notesPage_);
@@ -1400,9 +1993,9 @@ auto *bindScroll = new QScrollArea(drawerContent_);
     brushBtn->setMenu(brushMenu);
 
     auto *closeNotesBtn = button(QStringLiteral("Назад в терминал"), notesPage_);
-    connect(closeNotesBtn, &QPushButton::clicked, this, [this] { setNotesVisible(false); });
+    connect(closeNotesBtn, &QPushButton::clicked, this, [this, boardsDrawer] { setNotesVisible(false); });
     notesLayout->addWidget(notesTitle);
-    notesHeader->addWidget(addCard);
+    auto *addMediaBtn = button(QStringLiteral("+ Медиа"), notesPage_); connect(addMediaBtn, &QPushButton::clicked, this, [this, view] { const QStringList f = QFileDialog::getOpenFileNames(this, QStringLiteral("Добавить медиа"), QString(), QStringLiteral("Медиа (*.png *.jpg *.jpeg *.webp *.bmp *.tiff *.tif *.ico *.svg *.gif *.mp4 *.webm *.mkv *.avi *.mov *.m4v *.wmv)")); if (!f.isEmpty() && view && view->filesDroppedAt) view->filesDroppedAt(f, view->mapToScene(view->viewport()->rect().center())); }); notesHeader->addWidget(addCard); notesHeader->addWidget(addMediaBtn);
     notesHeader->addWidget(drawBtn);
     notesHeader->addWidget(linkBtn);
     notesHeader->addWidget(selectBtn);
@@ -1453,7 +2046,7 @@ auto *bindScroll = new QScrollArea(drawerContent_);
     connect(drawBtn,&QPushButton::toggled,view,[view,eraseBtn,linkBtn,selectBtn](bool on){view->drawMode_=on;if(on){eraseBtn->setChecked(false);linkBtn->setChecked(false);selectBtn->setChecked(false);view->eraseMode_=false;view->linkMode_=false;view->selectMode_=false;view->setDragMode(QGraphicsView::NoDrag);}view->setCursor(on?Qt::CrossCursor:Qt::ArrowCursor);});
     connect(eraseBtn,&QPushButton::toggled,view,[view,drawBtn,linkBtn,selectBtn](bool on){view->eraseMode_=on;if(on){drawBtn->setChecked(false);linkBtn->setChecked(false);selectBtn->setChecked(false);view->drawMode_=false;view->linkMode_=false;view->selectMode_=false;view->setDragMode(QGraphicsView::NoDrag);}view->setCursor(on?Qt::PointingHandCursor:Qt::ArrowCursor);});
     connect(linkBtn,&QPushButton::toggled,view,[view,drawBtn,eraseBtn,selectBtn](bool on){view->linkMode_=on;if(on){drawBtn->setChecked(false);eraseBtn->setChecked(false);selectBtn->setChecked(false);view->drawMode_=false;view->eraseMode_=false;view->selectMode_=false;view->setDragMode(QGraphicsView::NoDrag);}});
-    connect(selectBtn,&QPushButton::toggled,view,[this,view,drawBtn,linkBtn,eraseBtn](bool on){view->selectMode_=on;if(on){drawBtn->setChecked(false);linkBtn->setChecked(false);eraseBtn->setChecked(false);view->drawMode_=view->linkMode_=view->eraseMode_=false;view->setDragMode(QGraphicsView::RubberBandDrag);view->setCursor(Qt::ArrowCursor);}else view->setDragMode(QGraphicsView::NoDrag);for(QGraphicsItem *item:noteScene_->items())if(auto *card=dynamic_cast<NoteCard *>(item))card->setSelectionMode(on);});
+    connect(selectBtn,&QPushButton::toggled,view,[this,view,drawBtn,linkBtn,eraseBtn](bool on){view->selectMode_=on;if(on){drawBtn->setChecked(false);linkBtn->setChecked(false);eraseBtn->setChecked(false);view->drawMode_=view->linkMode_=view->eraseMode_=false;view->setDragMode(QGraphicsView::RubberBandDrag);view->setCursor(Qt::ArrowCursor);}else view->setDragMode(QGraphicsView::NoDrag);for(QGraphicsItem *item:noteScene_->items())if(auto *card=dynamic_cast<NoteCard *>(item))card->setSelectionMode(on); noteScene_->update(); saveNotes();});
     connect(clearDrawBtn, &QPushButton::clicked, view, [view]{ view->clearStrokes(); });
     connect(undoBtn,&QPushButton::clicked,view,[view]{view->undoStroke();});
     auto *boardRow = new QHBoxLayout;
@@ -2578,7 +3171,7 @@ void MainWindow::openSshExplorer(ConsoleSession *session)
                 if (item) menu.addSeparator();
                 QAction *actPaste = menu.addAction(QStringLiteral("📋  Вставить сюда (%1)").arg(QString::number(s_sftpCutRemotePaths.size())));
                 connect(actPaste, &QAction::triggered, this, [this, pasteHereBtn] {
-                    if (!sshExplorerSession_ || s_sftpCutRemotePath.isEmpty()) return;
+                    if (!sshExplorerSession_ || s_sftpCutRemotePaths.isEmpty()) return;
                     QString dir = sshExplorerPath_->text().trimmed();
                     if (dir.isEmpty()) dir = sshExplorerSession_->remoteDirectory;
                     const QString src = s_sftpCutRemotePaths.first();
@@ -3121,20 +3714,20 @@ void MainWindow::saveNotes() const
     QJsonArray edges;
     for (QGraphicsItem *item : noteScene_->items()) {
         if (const auto *card = dynamic_cast<const NoteCard *>(item)) {
-            cards.append(QJsonObject{{QStringLiteral("id"), card->id()}, {QStringLiteral("title"), card->heading()}, {QStringLiteral("body"), card->content()}, {QStringLiteral("x"), card->pos().x()}, {QStringLiteral("y"), card->pos().y()}, {QStringLiteral("width"), card->cardWidth()}, {QStringLiteral("height"), card->cardHeight()}});
+            cards.append(QJsonObject{{QStringLiteral("id"), card->id()}, {QStringLiteral("title"), card->heading()}, {QStringLiteral("body"), card->content()}, {QStringLiteral("x"), card->pos().x()}, {QStringLiteral("y"), card->pos().y()}, {QStringLiteral("width"), card->cardWidth()}, {QStringLiteral("height"), card->cardHeight()}, {QStringLiteral("media"), card->mediaPath()}, {QStringLiteral("selected"), card->isSelected()}});
         } else if (const auto *edge = dynamic_cast<const NoteEdge *>(item)) {
             edges.append(QJsonObject{{QStringLiteral("from"), edge->from()->id()}, {QStringLiteral("to"), edge->to()->id()}});
         }
     }
     const QString directory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     QDir().mkpath(directory);
-    QFile file(directory + QStringLiteral("/notes.json"));
+    QFile file(activeNotesFilePath());
     if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) file.write(QJsonDocument(QJsonObject{{QStringLiteral("cards"), cards}, {QStringLiteral("edges"), edges}}).toJson());
 }
 
 void MainWindow::loadNotes()
 {
-    QFile file(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/notes.json"));
+    QFile file(activeNotesFilePath());
     if (!file.open(QIODevice::ReadOnly)) return;
     const QJsonObject document = QJsonDocument::fromJson(file.readAll()).object();
     loadingNotes_ = true;
@@ -3143,7 +3736,7 @@ void MainWindow::loadNotes()
         const QJsonObject object = value.toObject();
         const QString id = object.value(QStringLiteral("id")).toString();
         auto *card = dynamic_cast<NoteCard *>(createNote(QPointF(object.value(QStringLiteral("x")).toDouble(), object.value(QStringLiteral("y")).toDouble()), object.value(QStringLiteral("title")).toString(), object.value(QStringLiteral("body")).toString(), id));
-        card->setStoredSize(object.value(QStringLiteral("width")).toDouble(260.0),object.value(QStringLiteral("height")).toDouble(174.0));
+        const QString m = object.value(QStringLiteral("media")).toString(); if (!m.isEmpty() && QFileInfo::exists(m)) { card->setMediaFile(m); card->pauseMedia(); } card->setStoredSize(object.value(QStringLiteral("width")).toDouble(260.0),object.value(QStringLiteral("height")).toDouble(174.0)); card->setSelected(object.value(QStringLiteral("selected")).toBool(false));
         cards.insert(id, card);
     }
     for (const QJsonValue &value : document.value(QStringLiteral("edges")).toArray()) {
@@ -3338,6 +3931,54 @@ void MainWindow::buildSettingsPage()
     sizeCombo->setCurrentIndex(qBound(0, noteCardSizePreset_, 2));
     sizeLayout->addWidget(sizeCombo);
     notesLayoutSection->addWidget(sizeRow);
+
+    QSettings selStore(QString::fromLatin1(kSettingsOrg), QString::fromLatin1(kSettingsApp));
+    s_noteSelBorderColor = selStore.value(QStringLiteral("noteSelBorderColor"), QStringLiteral("#ffffff")).toString();
+    s_noteSelTextColor = selStore.value(QStringLiteral("noteSelTextColor"), QStringLiteral("#ffffff")).toString();
+
+    auto *selColorsCard = new QFrame(content);
+    selColorsCard->setProperty("searchText", QStringLiteral("выделение цвет рамки текста заметки selection border text color"));
+    auto *selColorsLay = new QVBoxLayout(selColorsCard);
+    selColorsLay->setSpacing(10);
+
+    auto makeColorPickerRow = [&](const QString &labelText, const QString &settingKey, QString *targetVar) {
+        auto *row = new QHBoxLayout;
+        row->addWidget(new QLabel(labelText, selColorsCard));
+        row->addStretch(1);
+        const QList<QPair<QString, QString>> swatches = {
+            {QStringLiteral("Белый"), QStringLiteral("#ffffff")},
+            {QStringLiteral("Голубой"), QStringLiteral("#7eb8da")},
+            {QStringLiteral("Мятный"), QStringLiteral("#71d6a3")},
+            {QStringLiteral("Янтарный"), QStringLiteral("#f5b971")},
+            {QStringLiteral("Коралл"), QStringLiteral("#f28b82")},
+            {QStringLiteral("Сирень"), QStringLiteral("#c4b5fd")}
+        };
+        auto *grp = new QButtonGroup(selColorsCard);
+        grp->setExclusive(true);
+        for (const auto &sw : swatches) {
+            auto *btn = new QPushButton(selColorsCard);
+            btn->setCheckable(true);
+            btn->setFixedSize(22, 22);
+            btn->setCursor(Qt::PointingHandCursor);
+            btn->setToolTip(sw.first);
+            btn->setChecked(*targetVar == sw.second);
+            btn->setStyleSheet(QStringLiteral("QPushButton{background:%1;border:2px solid rgba(255,255,255,0.22);border-radius:11px;padding:0;min-height:22px;max-width:22px;}QPushButton:checked{border:2.5px solid #ffffff;}").arg(sw.second));
+            const QString hex = sw.second;
+            connect(btn, &QPushButton::clicked, this, [this, hex, settingKey, targetVar, notesPreview] {
+                *targetVar = hex;
+                QSettings st(QString::fromLatin1(kSettingsOrg), QString::fromLatin1(kSettingsApp));
+                st.setValue(settingKey, hex);
+                if (noteScene_) noteScene_->update(); if (notesPreview) notesPreview->update();
+            });
+            grp->addButton(btn);
+            row->addWidget(btn);
+        }
+        selColorsLay->addLayout(row);
+    };
+
+    makeColorPickerRow(QStringLiteral("Цвет рамки при выделении"), QStringLiteral("noteSelBorderColor"), &s_noteSelBorderColor);
+    makeColorPickerRow(QStringLiteral("Цвет текста при выделении"), QStringLiteral("noteSelTextColor"), &s_noteSelTextColor);
+    notesLayoutSection->addWidget(selColorsCard);
     connect(zoomSlider, &QSlider::valueChanged, this, [this, zoomLabel, notesPreview](int value) {
         notesZoomOutPercent_ = value;
         zoomLabel->setText(QStringLiteral("Максимальное отдаление холста (Zoom Out): %1%").arg(value));
@@ -3627,6 +4268,37 @@ void MainWindow::buildSettingsPage()
     scaleLayout->addWidget(scaleLabel);
     scaleLayout->addWidget(scale);
     scaleLayoutSection->addWidget(scaleCard);
+    auto *audioCard = new QFrame(content);
+    audioCard->setProperty("searchText", QStringLiteral("звук динамик аудио устройство вывод speaker audio output"));
+    auto *audioLayout = new QVBoxLayout(audioCard);
+    audioLayout->addWidget(new QLabel(QStringLiteral("Устройство вывода звука (динамик)"), audioCard));
+    auto *speakerCombo = new QComboBox(audioCard);
+    speakerCombo->addItem(QStringLiteral("Системное устройство по умолчанию"), -1);
+#ifdef Q_OS_WIN
+    const UINT numDevs = waveOutGetNumDevs();
+    for (UINT d = 0; d < numDevs; ++d) {
+        WAVEOUTCAPSW caps{};
+        if (waveOutGetDevCapsW(d, &caps, sizeof(caps)) == MMSYSERR_NOERROR)
+            speakerCombo->addItem(QString::fromWCharArray(caps.szPname), int(d));
+    }
+#endif
+    QSettings audioSt(QString::fromLatin1(kSettingsOrg), QString::fromLatin1(kSettingsApp));
+    s_selectedAudioDeviceId = audioSt.value(QStringLiteral("audioOutputDevice"), -1).toInt();
+    const int savedDevIdx = speakerCombo->findData(s_selectedAudioDeviceId);
+    if (savedDevIdx >= 0) speakerCombo->setCurrentIndex(savedDevIdx);
+    connect(speakerCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [speakerCombo](int idx) {
+        s_selectedAudioDeviceId = speakerCombo->itemData(idx).toInt();
+        QSettings st(QString::fromLatin1(kSettingsOrg), QString::fromLatin1(kSettingsApp));
+        st.setValue(QStringLiteral("audioOutputDevice"), s_selectedAudioDeviceId);
+    });
+    auto *speakerRow = new QHBoxLayout;
+    auto *testSoundBtn = button(QStringLiteral("Проверить"), audioCard);
+    testSoundBtn->setFixedWidth(95);
+    connect(testSoundBtn, &QPushButton::clicked, this, [] { MessageBeep(MB_OK); });
+    speakerRow->addWidget(speakerCombo, 1);
+    speakerRow->addWidget(testSoundBtn);
+    audioLayout->addLayout(speakerRow);
+    scaleLayoutSection->addWidget(audioCard);
     connect(scale, &QSlider::valueChanged, settingsPage_, [updatePreviewFunction](int){ if (*updatePreviewFunction) (*updatePreviewFunction)(); });
     connect(starsToggle, &QAbstractButton::toggled, settingsPage_, [updatePreviewFunction](bool){ if (*updatePreviewFunction) (*updatePreviewFunction)(); });
     connect(themeCombo, qOverload<int>(&QComboBox::currentIndexChanged), settingsPage_, [this, selectedAccent, themeCombo, alpha, fontSize, scale, starsToggle, windowOpacitySlider, paletteGrid, updatePreviewFunction](int index) {

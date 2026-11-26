@@ -13,7 +13,7 @@ HEADERS += \
 
 win32 {
     DEFINES += _WIN32_WINNT=0x0A00 NTDDI_VERSION=0x0A000006
-    LIBS += -ldwmapi -luser32 -lkernel32
+    LIBS += -ldwmapi -lmfplat -lmfreadwrite -lmfuuid -lole32 -luuid -lwinmm -luser32 -lkernel32
 }
 
 unix: LIBS += -lutil
