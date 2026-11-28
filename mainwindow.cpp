@@ -1391,6 +1391,14 @@ public:
     std::function<void()> cancelLink; std::function<void()> leaveNotes;
     std::function<void(const QStringList &, const QPointF &)> filesDroppedAt;
     bool drawMode_ = false, eraseMode_ = false, linkMode_ = false, selectMode_ = false;
+    void resetInteractions() {
+        panning_ = false; movingSelection_ = false; isDrawing_ = false;
+        linkGestureActive_ = false; linkGestureSource_ = nullptr;
+        selectionStartPositions_.clear();
+        setDragMode(QGraphicsView::NoDrag);
+        if (viewport()) viewport()->unsetCursor();
+        unsetCursor();
+    }
     void setZoomOutLimit(int percent) { minimumZoom_ = qBound(0.10, percent / 100.0, 0.50); if (zoom_ < minimumZoom_) { const qreal f = minimumZoom_ / zoom_; zoom_ = minimumZoom_; scale(f, f); } }
     QString drawColor_ = QStringLiteral("#a78bfa"); qreal brushWidth_ = 3.0; QPointF lastDrawPt_; bool isDrawing_ = false;
     QList<QGraphicsPathItem *> drawnItems_;
@@ -1630,27 +1638,6 @@ protected:
         unsetCursor();
         QGraphicsView::mouseReleaseEvent(event);
     }
-    void mouseReleaseEventUnused(QMouseEvent *event)
-    {
-        if (drawMode_ && isDrawing_) { isDrawing_ = false; event->accept(); return; }
-        if (panning_) {
-            panning_ = false;
-            setCursor(Qt::ArrowCursor);
-            event->accept();
-            return;
-        }
-        if(movingSelection_){movingSelection_=false;selectionStartPositions_.clear();event->accept();return;}
-        if(linkGestureActive_){
-            NoteCard *destination=cardAt(event->position().toPoint());
-            if(destination&&linkAt&&hasLinkStart&&hasLinkStart()&&isLinkStart&&!isLinkStart(destination))linkAt(destination);
-            linkGestureActive_=false;
-            linkGestureSource_=nullptr;
-            event->accept();
-            return;
-        }
-        QGraphicsView::mouseReleaseEvent(event);
-    }
-
 private:
     bool panning_ = false;
     bool linkGestureActive_ = false;
@@ -1763,6 +1750,31 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     auto *navLayout = new QVBoxLayout(nav_);
     navLayout->setContentsMargins(8, 8, 8, 8);
     navLayout->setSpacing(6);
+    class NavDragStrip final : public QWidget {
+    public:
+        explicit NavDragStrip(QWidget *parent) : QWidget(parent) { setFixedHeight(22); setCursor(Qt::OpenHandCursor); }
+    protected:
+        void paintEvent(QPaintEvent *) override {
+            QPainter p(this); p.setRenderHint(QPainter::Antialiasing);
+            p.setPen(QPen(QColor(255,255,255,75), 1.4));
+            const qreal cx = width() / 2.0;
+            p.drawLine(QPointF(cx-16, height()/2.0), QPointF(cx+16, height()/2.0));
+        }
+        void mousePressEvent(QMouseEvent *e) override {
+            if (e->button() != Qt::LeftButton) return;
+            if (this->window()->windowHandle() && this->window()->windowHandle()->startSystemMove()) { e->accept(); return; }
+            dragging_ = true; offset_ = e->globalPosition().toPoint() - this->window()->frameGeometry().topLeft();
+        }
+        void mouseMoveEvent(QMouseEvent *e) override {
+            if (dragging_ && (e->buttons() & Qt::LeftButton)) this->window()->move(e->globalPosition().toPoint() - offset_);
+        }
+        void mouseReleaseEvent(QMouseEvent *) override { dragging_ = false; }
+    private:
+        bool dragging_ = false; QPoint offset_;
+    };
+    auto *dragStrip = new NavDragStrip(nav_);
+    dragStrip->setToolTip(QStringLiteral("Перетащите, чтобы переместить окно"));
+    navLayout->addWidget(dragStrip);
     auto *newConsole = button(QStringLiteral("＋  Новая консоль"), nav_);
     newConsole->setToolTip(QStringLiteral("Новая вкладка терминала"));
     tabHost_ = new QWidget(nav_);
@@ -1907,11 +1919,13 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     consoleLayout->setContentsMargins(0, 0, 0, 0);
     consoleLayout->setSpacing(10);
     sessionStack_ = new QStackedWidget(consolePage_);
+    sessionStack_->setMinimumWidth(420);
+    sessionStack_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     consoleLayout->addWidget(sessionStack_, 1);
 
     drawer_ = new QWidget(consolePage_);
     drawer_->setObjectName(QStringLiteral("drawerPanel"));
-    drawer_->setMinimumWidth(270);
+    drawer_->setMinimumWidth(0);
     drawer_->setMaximumWidth(270);
     auto *drawerLayout = new QVBoxLayout(drawer_);
     drawerLayout->setContentsMargins(0, 0, 0, 0);
@@ -1922,7 +1936,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     contentLayout->setSpacing(10);
     auto *actualDrawerLayout = contentLayout;
     drawerLayout->addWidget(drawerContent_);
-    auto *drawerTitle = new QLabel(QStringLiteral("Пользовательские бинды"), drawerContent_);
+    auto *drawerTitle = new QLabel(QStringLiteral("Бинды"), drawerContent_);
+    drawerTitle->setToolTip(QStringLiteral("Пользовательские бинды"));
     drawerTitle->setStyleSheet(QStringLiteral("font-size:15px;font-weight:600;"));
     auto *drawerHeader = new QHBoxLayout;
     drawerHeader->addWidget(drawerTitle, 1);
@@ -2066,10 +2081,10 @@ auto *bindScroll = new QScrollArea(drawerContent_);
         if (previewGlow_) previewGlow_->setPath(path);
     };
     view->drawColor_ = accent_;
-    connect(drawBtn,&QPushButton::toggled,view,[view,eraseBtn,linkBtn,selectBtn](bool on){view->drawMode_=on;if(on){eraseBtn->setChecked(false);linkBtn->setChecked(false);selectBtn->setChecked(false);view->eraseMode_=false;view->linkMode_=false;view->selectMode_=false;view->setDragMode(QGraphicsView::NoDrag);}view->setCursor(on?Qt::CrossCursor:Qt::ArrowCursor);});
-    connect(eraseBtn,&QPushButton::toggled,view,[view,drawBtn,linkBtn,selectBtn](bool on){view->eraseMode_=on;if(on){drawBtn->setChecked(false);linkBtn->setChecked(false);selectBtn->setChecked(false);view->drawMode_=false;view->linkMode_=false;view->selectMode_=false;view->setDragMode(QGraphicsView::NoDrag);}view->setCursor(on?Qt::PointingHandCursor:Qt::ArrowCursor);});
-    connect(linkBtn,&QPushButton::toggled,view,[view,drawBtn,eraseBtn,selectBtn](bool on){view->linkMode_=on;if(on){drawBtn->setChecked(false);eraseBtn->setChecked(false);selectBtn->setChecked(false);view->drawMode_=false;view->eraseMode_=false;view->selectMode_=false;view->setDragMode(QGraphicsView::NoDrag);}});
-    connect(selectBtn,&QPushButton::toggled,view,[this,view,drawBtn,linkBtn,eraseBtn](bool on){view->selectMode_=on;if(on){drawBtn->setChecked(false);linkBtn->setChecked(false);eraseBtn->setChecked(false);view->drawMode_=view->linkMode_=view->eraseMode_=false;view->setDragMode(QGraphicsView::RubberBandDrag);view->setCursor(Qt::ArrowCursor);}else view->setDragMode(QGraphicsView::NoDrag);for(QGraphicsItem *item:noteScene_->items())if(auto *card=dynamic_cast<NoteCard *>(item))card->setSelectionMode(on); noteScene_->update(); saveNotes();});
+    connect(drawBtn,&QPushButton::toggled,view,[view,eraseBtn,linkBtn,selectBtn](bool on){view->resetInteractions();view->drawMode_=on;if(on){eraseBtn->setChecked(false);linkBtn->setChecked(false);selectBtn->setChecked(false);view->eraseMode_=false;view->linkMode_=false;view->selectMode_=false;}view->setCursor(on?Qt::CrossCursor:Qt::ArrowCursor);});
+    connect(eraseBtn,&QPushButton::toggled,view,[view,drawBtn,linkBtn,selectBtn](bool on){view->resetInteractions();view->eraseMode_=on;if(on){drawBtn->setChecked(false);linkBtn->setChecked(false);selectBtn->setChecked(false);view->drawMode_=false;view->linkMode_=false;view->selectMode_=false;}view->setCursor(on?Qt::PointingHandCursor:Qt::ArrowCursor);});
+    connect(linkBtn,&QPushButton::toggled,view,[view,drawBtn,eraseBtn,selectBtn](bool on){view->resetInteractions();view->linkMode_=on;if(on){drawBtn->setChecked(false);eraseBtn->setChecked(false);selectBtn->setChecked(false);view->drawMode_=false;view->eraseMode_=false;view->selectMode_=false;}view->setCursor(on?Qt::CrossCursor:Qt::ArrowCursor);});
+    connect(selectBtn,&QPushButton::toggled,view,[this,view,drawBtn,linkBtn,eraseBtn](bool on){view->resetInteractions();view->selectMode_=on;if(on){drawBtn->setChecked(false);linkBtn->setChecked(false);eraseBtn->setChecked(false);view->drawMode_=view->linkMode_=view->eraseMode_=false;view->setDragMode(QGraphicsView::RubberBandDrag);view->setCursor(Qt::ArrowCursor);}for(QGraphicsItem *item:noteScene_->items())if(auto *card=dynamic_cast<NoteCard *>(item))card->setSelectionMode(on); noteScene_->update(); saveNotes();});
     connect(clearDrawBtn, &QPushButton::clicked, view, [view]{ view->clearStrokes(); });
     connect(undoBtn,&QPushButton::clicked,view,[view]{view->undoStroke();});
     auto *boardRow = new QHBoxLayout;
@@ -2837,7 +2852,7 @@ void MainWindow::openSshExplorer(ConsoleSession *session)
 
         sshExplorerCard_ = new QFrame(sshExplorerOverlay_);
         sshExplorerCard_->setObjectName(QStringLiteral("sshExplorerCard"));
-        sshExplorerCard_->setMinimumSize(720, 480);
+        sshExplorerCard_->setMinimumSize(640, 460);
         sshExplorerCard_->resize(860, 560);
 
         auto *rootLayout = new QVBoxLayout(sshExplorerCard_);
@@ -3242,8 +3257,8 @@ void MainWindow::openSshExplorer(ConsoleSession *session)
             void mouseMoveEvent(QMouseEvent *e) override {
                 if (drag_ && card_ && card_->parentWidget()) {
                     const QPoint d = e->globalPosition().toPoint() - pos_;
-                    const int w = qBound(720, sz_.width() + d.x() * 2, qMax(720, card_->parentWidget()->width() - 32));
-                    const int h = qBound(480, sz_.height() + d.y() * 2, qMax(480, card_->parentWidget()->height() - 32));
+                    const int w = qBound(640, sz_.width() + d.x() * 2, qMax(640, card_->parentWidget()->width() - 32));
+                    const int h = qBound(460, sz_.height() + d.y() * 2, qMax(460, card_->parentWidget()->height() - 32));
                     card_->resize(w, h); card_->move((card_->parentWidget()->width() - w) / 2, (card_->parentWidget()->height() - h) / 2);
                 }
             }
@@ -3355,12 +3370,21 @@ void MainWindow::openSshExplorer(ConsoleSession *session)
             if (!sshExplorerSession_) return;
             const QStringList locals = QFileDialog::getOpenFileNames(this, QStringLiteral("Загрузить файлы на сервер")); if (locals.isEmpty()) return;
             QString dir = sshExplorerPath_->text().trimmed(); if (dir.isEmpty()) dir = sshExplorerSession_->remoteDirectory;
+            dir = QDir::fromNativeSeparators(dir);
             QStringList cmds;
+            cmds.append(QStringLiteral("cd %1").arg(sftpQuote(dir)));
             for (const QString &l : locals) {
-                const QString dst = QDir::cleanPath(QDir(dir).filePath(QFileInfo(l).fileName()));
-                cmds.append(QStringLiteral("put \"%1\" %2").arg(QDir::toNativeSeparators(l), sftpQuote(dst)));
+                QString localPath = QDir::fromNativeSeparators(QFileInfo(l).absoluteFilePath());
+                localPath.replace(QLatin1Char('"'), QStringLiteral("\\\""));
+                QString dst = dir;
+                if (!dst.isEmpty() && dst != QStringLiteral("." ) && !dst.endsWith(QLatin1Char('/'))) dst += QLatin1Char('/');
+                if (dst == QStringLiteral(".")) dst.clear();
+                dst += QFileInfo(l).fileName();
+                cmds.append(QStringLiteral("put \"%1\" \"%2\"").arg(localPath, dst));
             }
-            startSftpTransfer(cmds, QStringLiteral("Загружено в %1").arg(dir));
+            cmds.append(QStringLiteral("ls -la"));
+            const QString fileLabel = locals.size() == 1 ? QFileInfo(locals.first()).fileName() : QStringLiteral("%1 файлов").arg(locals.size());
+            startSftpTransfer(cmds, QStringLiteral("Загружено: %1").arg(fileLabel));
         });
 
         sshExplorerCard_->setStyleSheet(QStringLiteral("QFrame#sshExplorerCard{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(28,34,46,0.97),stop:1 rgba(16,20,28,0.97));border:1px solid rgba(255,255,255,0.16);border-radius:18px;}QTreeWidget{background:rgba(7,10,15,0.38);border:1px solid rgba(255,255,255,0.08);border-radius:12px;alternate-background-color:rgba(255,255,255,0.02);}QTreeWidget::item{height:30px;border-bottom:1px solid rgba(255,255,255,0.04);}QTreeWidget::item:selected{background:rgba(126,184,218,0.22);}QHeaderView::section{background:rgba(255,255,255,0.05);border:0;padding:7px;color:rgba(245,247,250,0.7);}"));
@@ -4588,7 +4612,9 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 void MainWindow::resizeEvent(QResizeEvent *event)
 {
     QMainWindow::resizeEvent(event);
-    if (starfield_ && root_) starfield_->setGeometry(root_->rect());
+    if (starfield_ && root_) { starfield_->setGeometry(root_->rect()); starfield_->update(); }
+    if (root_) root_->update();
+    if (event->size().width() < 1050 && drawerOpen_) toggleDrawer();
     if (settingsOverlay_) {
         settingsOverlay_->setGeometry(root_->rect());
     }
