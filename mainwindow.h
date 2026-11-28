@@ -7,6 +7,7 @@
 #include <QHash>
 #include <QMainWindow>
 #include <QProcess>
+#include <QPointer>
 #include "terminal_backend.h"
 #include <QStringList>
 #include <QVector>
@@ -94,6 +95,7 @@ private:
     ConsoleSession *currentSession() const;
     ConsoleSession *findSession(quint64 id) const;
     void activateSession(ConsoleSession *session);
+    void reorderSession(int from, int to);
     void closeSession(ConsoleSession *session);
     void renameSession(ConsoleSession *session);
     void startProcess(ConsoleSession *session, const QString &shell, bool elevated = false);
@@ -201,6 +203,9 @@ private:
     bool loadingNotes_ = false;
     bool windowDragging_ = false;
     QPoint dragOffset_;
+    QPointer<QPushButton> draggingTabButton_;
+    QPoint tabPressPosition_;
+    bool tabReorderActive_ = false;
     QGraphicsObject *linkStart_ = nullptr;
     QGraphicsPathItem *previewPath_ = nullptr;
     QGraphicsPathItem *previewGlow_ = nullptr;

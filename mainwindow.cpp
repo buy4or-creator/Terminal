@@ -1753,22 +1753,6 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     auto *navLayout = new QVBoxLayout(nav_);
     navLayout->setContentsMargins(8, 8, 8, 8);
     navLayout->setSpacing(6);
-    class NavDragStrip final : public QWidget {
-    public:
-        explicit NavDragStrip(QWidget *parent) : QWidget(parent) { setFixedHeight(22); setCursor(Qt::OpenHandCursor); }
-    protected:
-        void paintEvent(QPaintEvent *) override {
-            QPainter p(this); p.setRenderHint(QPainter::Antialiasing);
-            p.setPen(QPen(QColor(255,255,255,75), 1.4));
-            const qreal cx = width() / 2.0;
-            p.drawLine(QPointF(cx-16, height()/2.0), QPointF(cx+16, height()/2.0));
-        }
-    };
-    auto *dragStrip = new NavDragStrip(nav_);
-    dragStrip->setObjectName(QStringLiteral("windowDragHandle"));
-    dragStrip->setToolTip(QStringLiteral("Перетащите, чтобы переместить окно"));
-    dragStrip->installEventFilter(this);
-    navLayout->addWidget(dragStrip);
     auto *newConsole = button(QStringLiteral("＋  Новая консоль"), nav_);
     newConsole->setToolTip(QStringLiteral("Новая вкладка терминала"));
     tabHost_ = new QWidget(nav_);
@@ -2237,6 +2221,8 @@ void MainWindow::createConsole()
     tabLayout->setSpacing(2);
     session->tabButton = button(session->title->text(), session->tabRow);
     session->tabButton->setObjectName(QStringLiteral("tabTitle"));
+    session->tabButton->setProperty("sessionId", QVariant::fromValue<qulonglong>(session->id));
+    session->tabButton->installEventFilter(this);
     session->tabButton->setCheckable(true);
     session->tabButton->setIcon(navigationDotIcon(false));
     session->tabButton->setIconSize(QSize(8, 8));
@@ -2272,6 +2258,7 @@ void MainWindow::createConsole()
     };
 
     connect(session->tabButton, &QPushButton::clicked, this, [this, session, resizeBackend] {
+        if (tabReorderActive_) return;
         activateSession(session);
         QTimer::singleShot(120, this, resizeBackend);
     });
@@ -2318,6 +2305,21 @@ void MainWindow::activateSession(ConsoleSession *session)
             if (output && output->isVisible()) output->setFocus(Qt::OtherFocusReason);
         });
     }
+}
+
+void MainWindow::reorderSession(int from, int to)
+{
+    if (from < 0 || to < 0 || from >= sessions_.size() || to >= sessions_.size() || from == to)
+        return;
+    ConsoleSession *moving = sessions_.takeAt(from);
+    sessions_.insert(to, moving);
+    if (auto *tabs = qobject_cast<QVBoxLayout *>(tabHost_ ? tabHost_->layout() : nullptr)) {
+        tabs->removeWidget(moving->tabRow);
+        tabs->insertWidget(to, moving->tabRow);
+    }
+    if (sessionStack_ && moving->page)
+        sessionStack_->insertWidget(to, moving->page);
+    updateNavigationIndicators();
 }
 
 void MainWindow::renameSession(ConsoleSession *session)
@@ -4512,6 +4514,44 @@ void MainWindow::saveSettings() const
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
     QWidget *dragWidget = qobject_cast<QWidget *>(watched);
+    if (auto *tab = qobject_cast<QPushButton *>(dragWidget);
+        tab && tab->objectName() == QStringLiteral("tabTitle")) {
+        const quint64 id = tab->property("sessionId").toULongLong();
+        ConsoleSession *session = findSession(id);
+        if (event->type() == QEvent::MouseButtonPress) {
+            auto *mouse = static_cast<QMouseEvent *>(event);
+            if (mouse->button() == Qt::LeftButton) {
+                draggingTabButton_ = tab;
+                tabPressPosition_ = mouse->globalPosition().toPoint();
+                tabReorderActive_ = false;
+            }
+        } else if (event->type() == QEvent::MouseMove && draggingTabButton_ == tab) {
+            auto *mouse = static_cast<QMouseEvent *>(event);
+            const QPoint delta = mouse->globalPosition().toPoint() - tabPressPosition_;
+            if ((mouse->buttons() & Qt::LeftButton) && qAbs(delta.y()) > 6) {
+                tabReorderActive_ = true;
+                int target = sessions_.indexOf(session);
+                const QPoint local = tabHost_->mapFromGlobal(mouse->globalPosition().toPoint());
+                for (int i = 0; i < sessions_.size(); ++i) {
+                    QWidget *row = sessions_.at(i)->tabRow;
+                    if (local.y() < row->geometry().center().y()) { target = i; break; }
+                    target = i;
+                }
+                reorderSession(sessions_.indexOf(session), target);
+                tab->setCursor(Qt::ClosedHandCursor);
+                return true;
+            }
+        } else if (event->type() == QEvent::MouseButtonRelease && draggingTabButton_ == tab) {
+            const bool reordered = tabReorderActive_;
+            draggingTabButton_.clear();
+            tabReorderActive_ = false;
+            tab->setCursor(Qt::PointingHandCursor);
+            if (reordered) return true;
+        } else if (event->type() == QEvent::MouseButtonDblClick && session) {
+            renameSession(session);
+            return true;
+        }
+    }
     const bool headerLabel = dragWidget && dragWidget->parentWidget()
         && dragWidget->parentWidget()->objectName() == QStringLiteral("topBar")
         && qobject_cast<QLabel *>(dragWidget);
