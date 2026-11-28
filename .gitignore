@@ -11,3 +11,9 @@ Makefile*
 .qmake.stash
 .vs/
 .vscode/
+
+release_v2.0/
+dist/
+*.zip
+*.tar.gz
+Terminal-Setup.exe
