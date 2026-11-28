@@ -818,6 +818,8 @@ public:
                 const QPixmap frame = movie_->currentPixmap();
                 if (!frame.isNull())
                     painter->drawPixmap(mediaRect.toRect(), frame.scaled(mediaRect.size().toSize(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
+                else if (!pixmap_.isNull())
+                    painter->drawPixmap(mediaRect.toRect(), pixmap_.scaled(mediaRect.size().toSize(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
             } else if (isAudio_) {
                 painter->fillRect(mediaRect, QColor(18, 22, 32, 195));
                 const QRectF playBtn(mediaRect.left() + 8, mediaRect.center().y() - 18, 36, 36);
@@ -925,6 +927,7 @@ public:
     }
     void setMediaFile(const QString &storedPath) {
         mediaPath_ = storedPath;
+        pixmap_ = QPixmap();
         if (mediaPath_.isEmpty()) return;
         const QString ext = QFileInfo(mediaPath_).suffix().toLower();
         isGif_ = (ext == QStringLiteral("gif"));
@@ -938,11 +941,19 @@ public:
         if (mfReader_) { mfReader_->Release(); mfReader_ = nullptr; }
 #endif
         if (isGif_) {
+            QImageReader firstFrameReader(mediaPath_);
+            firstFrameReader.setAutoTransform(true);
+            const QImage firstFrame = firstFrameReader.read();
+            if (!firstFrame.isNull()) pixmap_ = QPixmap::fromImage(firstFrame);
             movie_ = new QMovie(mediaPath_, QByteArray(), this);
             movie_->setCacheMode(QMovie::CacheAll);
-            connect(movie_, &QMovie::frameChanged, this, [this] { update(); });
-            connect(movie_, &QMovie::finished, this, [this] { if (movie_) movie_->start(); });
-            movie_->start();
+            connect(movie_, &QMovie::frameChanged, this, [this](int) { update(); });
+            if (movie_->isValid()) movie_->jumpToFrame(0);
+            // Start after the note scene finishes restoring. Let QMovie handle
+            // looping itself; manually restarting on finished caused recursion.
+            QTimer::singleShot(0, this, [this] {
+                if (movie_ && movie_->isValid()) movie_->start();
+            });
         } else if (isVideo_ || isAudio_) {
 #ifdef Q_OS_WIN
             CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); MFStartup(MF_VERSION);
@@ -2311,6 +2322,9 @@ void MainWindow::reorderSession(int from, int to)
 {
     if (from < 0 || to < 0 || from >= sessions_.size() || to >= sessions_.size() || from == to)
         return;
+    QHash<QWidget *, QRect> oldGeometry;
+    for (ConsoleSession *session : sessions_)
+        if (session && session->tabRow) oldGeometry.insert(session->tabRow, session->tabRow->geometry());
     ConsoleSession *moving = sessions_.takeAt(from);
     sessions_.insert(to, moving);
     if (auto *tabs = qobject_cast<QVBoxLayout *>(tabHost_ ? tabHost_->layout() : nullptr)) {
@@ -2319,6 +2333,19 @@ void MainWindow::reorderSession(int from, int to)
     }
     if (sessionStack_ && moving->page)
         sessionStack_->insertWidget(to, moving->page);
+    if (tabHost_ && tabHost_->layout()) tabHost_->layout()->activate();
+    for (auto it = oldGeometry.cbegin(); it != oldGeometry.cend(); ++it) {
+        QWidget *row = it.key();
+        const QRect destination = row->geometry();
+        if (!row || destination == it.value()) continue;
+        row->setGeometry(it.value());
+        auto *animation = new QPropertyAnimation(row, "geometry", row);
+        animation->setDuration(150);
+        animation->setEasingCurve(QEasingCurve::OutCubic);
+        animation->setStartValue(it.value());
+        animation->setEndValue(destination);
+        animation->start(QAbstractAnimation::DeleteWhenStopped);
+    }
     updateNavigationIndicators();
 }
 
@@ -4537,8 +4564,14 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
                     if (local.y() < row->geometry().center().y()) { target = i; break; }
                     target = i;
                 }
+                if (tabHost_) {
+                    tabHost_->setProperty("dropIndex", target);
+                    tabHost_->update();
+                }
                 reorderSession(sessions_.indexOf(session), target);
                 tab->setCursor(Qt::ClosedHandCursor);
+                tab->setProperty("dragReorderActive", true);
+                tab->setStyleSheet(QStringLiteral("QPushButton{background:rgba(126,184,218,0.28);border:1px solid #7eb8da;border-radius:8px;text-align:left;padding:4px 8px;}"));
                 return true;
             }
         } else if (event->type() == QEvent::MouseButtonRelease && draggingTabButton_ == tab) {
@@ -4546,6 +4579,8 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
             draggingTabButton_.clear();
             tabReorderActive_ = false;
             tab->setCursor(Qt::PointingHandCursor);
+            tab->setProperty("dragReorderActive", false);
+            tab->setStyleSheet(QStringLiteral("QPushButton{background:transparent;border:0;border-radius:8px;text-align:left;padding:4px 8px;}QPushButton:checked{background:rgba(255,255,255,0.12);border:0;}"));
             if (reordered) return true;
         } else if (event->type() == QEvent::MouseButtonDblClick && session) {
             renameSession(session);
