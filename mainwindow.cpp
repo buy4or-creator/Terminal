@@ -1712,6 +1712,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
                                                                            : QStringLiteral("#48db5f")));
         control->installEventFilter(this);
     }
+    header->setCursor(Qt::OpenHandCursor);
     header->installEventFilter(this);
     brandIcon->installEventFilter(this);
     brand->installEventFilter(this);
@@ -1747,6 +1748,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     nav_ = new QWidget(root_);
     nav_->setObjectName(QStringLiteral("nav"));
     nav_->setFixedWidth(190);
+    nav_->setCursor(Qt::OpenHandCursor);
+    nav_->installEventFilter(this);
     auto *navLayout = new QVBoxLayout(nav_);
     navLayout->setContentsMargins(8, 8, 8, 8);
     navLayout->setSpacing(6);
@@ -1760,20 +1763,11 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
             const qreal cx = width() / 2.0;
             p.drawLine(QPointF(cx-16, height()/2.0), QPointF(cx+16, height()/2.0));
         }
-        void mousePressEvent(QMouseEvent *e) override {
-            if (e->button() != Qt::LeftButton) return;
-            if (this->window()->windowHandle() && this->window()->windowHandle()->startSystemMove()) { e->accept(); return; }
-            dragging_ = true; offset_ = e->globalPosition().toPoint() - this->window()->frameGeometry().topLeft();
-        }
-        void mouseMoveEvent(QMouseEvent *e) override {
-            if (dragging_ && (e->buttons() & Qt::LeftButton)) this->window()->move(e->globalPosition().toPoint() - offset_);
-        }
-        void mouseReleaseEvent(QMouseEvent *) override { dragging_ = false; }
-    private:
-        bool dragging_ = false; QPoint offset_;
     };
     auto *dragStrip = new NavDragStrip(nav_);
+    dragStrip->setObjectName(QStringLiteral("windowDragHandle"));
     dragStrip->setToolTip(QStringLiteral("Перетащите, чтобы переместить окно"));
+    dragStrip->installEventFilter(this);
     navLayout->addWidget(dragStrip);
     auto *newConsole = button(QStringLiteral("＋  Новая консоль"), nav_);
     newConsole->setToolTip(QStringLiteral("Новая вкладка терминала"));
@@ -1784,7 +1778,12 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     tabLayout->setAlignment(Qt::AlignTop);
     navLayout->addWidget(newConsole);
     navLayout->addWidget(tabHost_);
-    navLayout->addStretch(1);
+    auto *navDragSpace = new QWidget(nav_);
+    navDragSpace->setObjectName(QStringLiteral("navDragSpace"));
+    navDragSpace->setCursor(Qt::OpenHandCursor);
+    navDragSpace->setStyleSheet(QStringLiteral("background:transparent;border:0;"));
+    navDragSpace->installEventFilter(this);
+    navLayout->addWidget(navDragSpace, 1);
     notesNavButton_ = button(QStringLiteral("Заметки"), nav_);
     settingsNavButton_ = button(QStringLiteral("Настройки"), nav_);
     settingsNavButton_->setToolTip(QStringLiteral("Настройки (Esc — закрыть)"));
@@ -4512,6 +4511,38 @@ void MainWindow::saveSettings() const
 
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
+    QWidget *dragWidget = qobject_cast<QWidget *>(watched);
+    const bool headerLabel = dragWidget && dragWidget->parentWidget()
+        && dragWidget->parentWidget()->objectName() == QStringLiteral("topBar")
+        && qobject_cast<QLabel *>(dragWidget);
+    const bool dragZone = dragWidget && (dragWidget == nav_
+        || dragWidget->objectName() == QStringLiteral("topBar")
+        || dragWidget->objectName() == QStringLiteral("windowDragHandle")
+        || dragWidget->objectName() == QStringLiteral("navDragSpace") || headerLabel);
+    if (dragZone && event->type() == QEvent::MouseButtonPress) {
+        auto *mouse = static_cast<QMouseEvent *>(event);
+        if (mouse->button() == Qt::LeftButton) {
+            if (windowHandle() && windowHandle()->startSystemMove()) return true;
+            windowDragging_ = true;
+            dragOffset_ = mouse->globalPosition().toPoint() - frameGeometry().topLeft();
+            dragWidget->setCursor(Qt::ClosedHandCursor);
+            dragWidget->grabMouse();
+            return true;
+        }
+    }
+    if (windowDragging_ && event->type() == QEvent::MouseMove) {
+        auto *mouse = static_cast<QMouseEvent *>(event);
+        if (mouse->buttons() & Qt::LeftButton) {
+            move(mouse->globalPosition().toPoint() - dragOffset_);
+            return true;
+        }
+    }
+    if (windowDragging_ && event->type() == QEvent::MouseButtonRelease
+        && static_cast<QMouseEvent *>(event)->button() == Qt::LeftButton) {
+        windowDragging_ = false;
+        if (dragWidget) { dragWidget->releaseMouse(); dragWidget->setCursor(Qt::OpenHandCursor); }
+        return true;
+    }
     if (watched == settingsCloseButton_ && (event->type() == QEvent::Enter || event->type() == QEvent::Leave))
         settingsCloseButton_->setText(event->type() == QEvent::Enter ? QStringLiteral("×") : QString());
     if (auto *widget = qobject_cast<QWidget *>(watched)) {
@@ -4586,17 +4617,6 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
             }
         }
     }
-#ifndef Q_OS_WIN
-    QWidget *watchedWidget = qobject_cast<QWidget *>(watched);
-    const bool dragHandle = watched && watched->objectName() == QStringLiteral("topBar")
-        || (watchedWidget && watchedWidget->parentWidget()
-            && watchedWidget->parentWidget()->objectName() == QStringLiteral("topBar"));
-    if (dragHandle && event->type() == QEvent::MouseButtonPress) {
-        auto *mouse = static_cast<QMouseEvent *>(event);
-        if (mouse->button() == Qt::LeftButton && windowHandle() && windowHandle()->startSystemMove())
-            return true;
-    }
-#endif
     if (event->type() == QEvent::Enter || event->type() == QEvent::Leave) {
         if (auto *control = qobject_cast<QPushButton *>(qobject_cast<QWidget *>(watched))) {
             const bool hovered = event->type() == QEvent::Enter;
